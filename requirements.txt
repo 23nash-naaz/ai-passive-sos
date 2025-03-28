@@ -3,7 +3,6 @@ streamlit-audiorecorder
 numpy
 wave
 requests
-smtplib
 pydub
 aiortc
 av
