@@ -1,6 +1,6 @@
 streamlit 
-pyaudio
+
 requests 
-sounddevice
+ streamlit-webrtc
 numpy
 
