@@ -1,6 +1,6 @@
 streamlit 
 av
 requests 
- streamlit-webrtc
+streamlit-webrtc
 numpy
 
