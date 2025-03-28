@@ -2,9 +2,16 @@ import time
 import requests
 import smtplib
 import streamlit as st
+
+# Try importing PyAV. If it fails, display an error message.
+try:
+    import av
+except Exception as e:
+    st.error("Failed to import PyAV. Please add 'av' (PyAV) to your requirements.txt and redeploy the app.")
+    raise e
+
 import numpy as np
 import wave
-import av
 from email.mime.text import MIMEText
 from threading import Thread
 from streamlit_webrtc import webrtc_streamer, AudioProcessorBase, RTCConfiguration
@@ -212,5 +219,6 @@ webrtc_streamer(
 )
 
 st.info("Passive SOS system is running. If distress keywords are detected in your speech, an SOS alert will be sent automatically.")
+
 
 
