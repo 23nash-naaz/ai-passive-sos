@@ -9,7 +9,7 @@ import numpy as np
 import wave
 
 # === AssemblyAI Configuration ===
-ASSEMBLYAI_API_KEY = "YOUR_ASSEMBLYAI_API_KEY"
+ASSEMBLYAI_API_KEY = "29f8ab7b44c64f58903439c9afe57ed4"
 ASSEMBLYAI_UPLOAD_URL = "https://api.assemblyai.com/v2/upload"
 ASSEMBLYAI_TRANSCRIPT_URL = "https://api.assemblyai.com/v2/transcript"
 
