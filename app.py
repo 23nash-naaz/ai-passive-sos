@@ -2,19 +2,18 @@ import time
 import requests
 import smtplib
 import streamlit as st
-
-# Try importing PyAV. If it fails, display an error message.
-try:
-    import av
-except Exception as e:
-    st.error("Failed to import PyAV. Please add 'av' (PyAV) to your requirements.txt and redeploy the app.")
-    raise e
-
 import numpy as np
 import wave
 from email.mime.text import MIMEText
 from threading import Thread
 from streamlit_webrtc import webrtc_streamer, AudioProcessorBase, RTCConfiguration
+
+# Attempt to import PyAV. If it fails, instruct the user.
+try:
+    import av
+except ModuleNotFoundError as e:
+    st.error("PyAV is not installed. Please add 'av' to your requirements.txt and redeploy the app.")
+    raise e
 
 # === AssemblyAI Configuration ===
 ASSEMBLYAI_API_KEY = "29f8ab7b44c64f58903439c9afe57ed4"  # Replace with your actual AssemblyAI API key
@@ -219,6 +218,7 @@ webrtc_streamer(
 )
 
 st.info("Passive SOS system is running. If distress keywords are detected in your speech, an SOS alert will be sent automatically.")
+
 
 
 
