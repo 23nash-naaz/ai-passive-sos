@@ -1,6 +1,9 @@
-streamlit 
-av
-requests 
+streamlit
 streamlit-webrtc
 numpy
-
+wave
+requests
+smtplib
+pydub
+aiortc
+av
