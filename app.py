@@ -1,8 +1,8 @@
 import time
+import os
 import requests
 import smtplib
 import streamlit as st
-import sounddevice as sd
 import numpy as np
 import wave
 from email.mime.text import MIMEText
@@ -14,9 +14,10 @@ ASSEMBLYAI_UPLOAD_URL = "https://api.assemblyai.com/v2/upload"
 ASSEMBLYAI_TRANSCRIPT_URL = "https://api.assemblyai.com/v2/transcript"
 
 # === Audio Configuration ===
-SAMPLE_RATE = 44100       # in Hz
-CHANNELS = 1              # mono audio
-CHUNK_DURATION = 5        # seconds per audio chunk
+# These parameters are for reference; ffmpeg handles the recording
+SAMPLE_RATE = 44100       # Hz
+CHANNELS = 1              # Mono audio
+CHUNK_DURATION = 5        # Seconds per audio chunk
 AUDIO_FILENAME = "temp_chunk.wav"
 
 # === Distress Keywords ===
@@ -41,10 +42,10 @@ st.markdown(
         text-align: center;
     }
     .section {
-        background-color: #gggggg;
+        background-color: #eeeeee;
         padding: 20px;
         border-radius: 10px;
-        box-shadow: 2px 2px 10px rgba(0,0,0.1,0.1);
+        box-shadow: 2px 2px 10px rgba(0,0,0,0.1);
         margin-bottom: 20px;
     }
     .btn {
@@ -75,19 +76,18 @@ with st.container():
     email_password = st.text_input("🔑 Enter your Email Password (App Password)", "", type="password")
     recipient_email = st.text_input("📩 Enter Recipient Email for SOS Alerts:", "")
 
-# --- Global flag for continuous recording ---
+# --- Global flags for continuous recording ---
 recording = False
 stop_due_to_distress = False
 
-def save_audio_chunk(audio_chunk, filename=AUDIO_FILENAME):
-    """Save a numpy audio chunk to a WAV file."""
-    audio_int16 = (audio_chunk * 32767).astype(np.int16)
-    with wave.open(filename, "wb") as wf:
-        wf.setnchannels(CHANNELS)
-        wf.setsampwidth(2)  # 16-bit audio = 2 bytes
-        wf.setframerate(SAMPLE_RATE)
-        wf.writeframes(audio_int16.tobytes())
-    st.info(f"✅ Audio chunk saved as {filename}")
+def record_audio(filename=AUDIO_FILENAME, duration=CHUNK_DURATION):
+    """
+    Record audio using ffmpeg and save it as a WAV file.
+    This command uses the ALSA input ('default'); adjust if needed.
+    """
+    command = f"ffmpeg -f alsa -i default -t {duration} {filename} -y"
+    os.system(command)
+    st.info(f"✅ Audio chunk recorded as {filename}")
 
 def upload_audio(file_path):
     """Upload audio file to AssemblyAI and return the audio URL."""
@@ -153,10 +153,9 @@ def send_alert_email(transcript_text):
     except Exception as e:
         st.error(f"❌ Failed to send email: {e}")
 
-def process_audio_chunk(audio_chunk):
-    """Process a single audio chunk: save, transcribe, detect distress, and send an alert if needed."""
+def process_audio_file():
+    """Process the recorded audio file: upload, transcribe, detect distress, and alert if needed."""
     global stop_due_to_distress
-    save_audio_chunk(audio_chunk)
     try:
         audio_url = upload_audio(AUDIO_FILENAME)
         transcript_id = request_transcription(audio_url)
@@ -167,44 +166,27 @@ def process_audio_chunk(audio_chunk):
             send_alert_email(transcript_text)
             stop_due_to_distress = True
     except Exception as e:
-        st.error(f"❌ Error processing audio chunk: {e}")
+        st.error(f"❌ Error processing audio file: {e}")
 
 def continuous_recording():
-    """Continuously record audio in CHUNK_DURATION segments and process each chunk.
-       Automatically stop if a distress keyword is detected."""
+    """
+    Continuously record audio in CHUNK_DURATION segments using ffmpeg
+    and process each chunk. Automatically stops if a distress keyword is detected.
+    """
     global recording, stop_due_to_distress
     st.info("🎤 Continuous Recording Started...")
     recording = True
     stop_due_to_distress = False
 
-    audio_buffer = []  # buffer for audio chunks
-    start_time = time.time()
-
-    # Callback to collect audio data
-    def audio_callback(indata, frames, time_info, status):
-        audio_buffer.append(indata.copy())
-
-    stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, callback=audio_callback)
-    stream.start()
-
     while recording:
-        if time.time() - start_time >= CHUNK_DURATION:
-            stream.stop()
-            if audio_buffer:
-                chunk_data = np.concatenate(audio_buffer, axis=0)
-                st.info("Processing audio chunk...")
-                process_audio_chunk(chunk_data)
-                audio_buffer.clear()
-                start_time = time.time()
-            # If distress was detected, stop recording automatically.
-            if stop_due_to_distress:
-                st.warning("⛔ Distress detected! Stopping continuous recording.")
-                recording = False
-                break
-            stream.start()  # Resume recording
+        record_audio()  # Record a chunk using ffmpeg
+        st.info("Processing audio chunk...")
+        process_audio_file()  # Process the recorded file
+        if stop_due_to_distress:
+            st.warning("⛔ Distress detected! Stopping continuous recording.")
+            recording = False
+            break
 
-    stream.stop()
-    stream.close()
     st.info("🛑 Continuous Recording Stopped.")
 
 # --- Button Section ---
@@ -214,4 +196,5 @@ if st.button("🎙️ Start Passive SOS", key="start"):
         st.warning("⚠️ Please fill in all email credentials before starting.")
     else:
         Thread(target=continuous_recording).start()
+
 
