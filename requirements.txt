@@ -1,6 +1,6 @@
 streamlit
 requests 
-ffmpeg-python
+imageio-ffmpeg
 numpy
 av
 gunicorn
