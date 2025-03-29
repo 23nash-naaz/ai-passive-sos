@@ -1,9 +1,7 @@
 streamlit
-streamlit-webrtc
+pyaudio
+requests 
+sounddevice
 numpy
-wave
-requests
-pydub
-aiortc
 av
 gunicorn
