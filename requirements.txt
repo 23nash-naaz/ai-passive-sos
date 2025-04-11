@@ -1,4 +1,6 @@
- streamlit
- numpy
+streamlit
+numpy
 requests
- pydub
+streamlit-webrtc
+av
+aiortc
