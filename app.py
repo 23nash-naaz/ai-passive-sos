@@ -12,19 +12,20 @@ import av
 import queue
 import threading
 import logging
+import wave
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # === AssemblyAI Configuration ===
-ASSEMBLYAI_API_KEY = "29f8ab7b44c64f58903439c9afe57ed4"  # AssemblyAI API key directly integrated
+ASSEMBLYAI_API_KEY = "29f8ab7b44c64f58903439c9afe57ed4"
 ASSEMBLYAI_UPLOAD_URL = "https://api.assemblyai.com/v2/upload"
 ASSEMBLYAI_TRANSCRIPT_URL = "https://api.assemblyai.com/v2/transcript"
 
 # === Audio Configuration ===
-SAMPLE_RATE = 16000      # sample rate for better web compatibility
-CHANNELS = 1             # mono audio
+SAMPLE_RATE = 16000  # sample rate for better web compatibility
+CHANNELS = 1         # mono audio
 
 # === Distress Keywords ===
 DISTRESS_KEYWORDS = {"help", "sos", "emergency", "911", "save me", "distress", "assistance", "trapped", "danger"}
@@ -40,6 +41,8 @@ if 'last_transcript' not in st.session_state:
     st.session_state.last_transcript = ""
 if 'processing' not in st.session_state:
     st.session_state.processing = False
+if 'webrtc_ctx' not in st.session_state:
+    st.session_state.webrtc_ctx = None
 
 # --- Custom CSS for Beautiful UI ---
 st.markdown(
@@ -160,17 +163,22 @@ def upload_audio_to_assemblyai(audio_file_path):
     """Upload audio file to AssemblyAI and return the audio URL."""
     headers = {"authorization": ASSEMBLYAI_API_KEY}
     
-    with open(audio_file_path, "rb") as f:
-        response = requests.post(
-            ASSEMBLYAI_UPLOAD_URL,
-            headers=headers,
-            data=f
-        )
-    
-    if response.status_code != 200:
-        raise Exception(f"Upload failed with status {response.status_code}: {response.text}")
+    try:
+        with open(audio_file_path, "rb") as f:
+            response = requests.post(
+                ASSEMBLYAI_UPLOAD_URL,
+                headers=headers,
+                data=f
+            )
         
-    return response.json()['upload_url']
+        if response.status_code != 200:
+            st.error(f"Upload failed with status {response.status_code}: {response.text}")
+            return None
+            
+        return response.json()['upload_url']
+    except Exception as e:
+        st.error(f"Error uploading audio: {str(e)}")
+        return None
 
 def request_transcription(audio_url):
     """Request transcription from AssemblyAI."""
@@ -179,34 +187,47 @@ def request_transcription(audio_url):
         "content-type": "application/json"
     }
     json_data = {"audio_url": audio_url}
-    response = requests.post(ASSEMBLYAI_TRANSCRIPT_URL, json=json_data, headers=headers)
     
-    if response.status_code != 200:
-        raise Exception(f"Transcription request failed with status {response.status_code}: {response.text}")
+    try:
+        response = requests.post(ASSEMBLYAI_TRANSCRIPT_URL, json=json_data, headers=headers)
         
-    return response.json()['id']
+        if response.status_code != 200:
+            st.error(f"Transcription request failed with status {response.status_code}: {response.text}")
+            return None
+            
+        return response.json()['id']
+    except Exception as e:
+        st.error(f"Error requesting transcription: {str(e)}")
+        return None
 
 def poll_transcription(transcript_id):
     """Poll AssemblyAI API until transcription is complete and return the text."""
     headers = {"authorization": ASSEMBLYAI_API_KEY}
     polling_url = f"{ASSEMBLYAI_TRANSCRIPT_URL}/{transcript_id}"
     
-    for _ in range(30):  # Set a limit to prevent infinite polling
-        response = requests.get(polling_url, headers=headers)
-        
-        if response.status_code != 200:
-            raise Exception(f"Polling failed with status {response.status_code}: {response.text}")
+    try:
+        for _ in range(30):  # Set a limit to prevent infinite polling
+            response = requests.get(polling_url, headers=headers)
             
-        result = response.json()
+            if response.status_code != 200:
+                st.error(f"Polling failed with status {response.status_code}: {response.text}")
+                return None
+                
+            result = response.json()
+            
+            if result['status'] == 'completed':
+                return result['text'] or "No speech detected."
+            elif result['status'] == 'error':
+                st.error(f"Transcription error: {result.get('error', 'Unknown error')}")
+                return None
+            
+            time.sleep(2)  # Wait 2 seconds between polling attempts
         
-        if result['status'] == 'completed':
-            return result['text'] or "No speech detected."
-        elif result['status'] == 'error':
-            raise Exception(f"Transcription error: {result.get('error', 'Unknown error')}")
-        
-        time.sleep(2)  # Wait 2 seconds between polling attempts
-    
-    raise Exception("Transcription timed out after 60 seconds")
+        st.warning("Transcription timed out after 60 seconds")
+        return None
+    except Exception as e:
+        st.error(f"Error polling transcription: {str(e)}")
+        return None
 
 def contains_distress(text):
     """Check if the transcript contains any distress keywords."""
@@ -267,6 +288,9 @@ def process_audio(audio_bytes):
         # Step 2: Upload to AssemblyAI
         status_placeholder.info("🔄 Uploading audio to transcription service...")
         audio_url = upload_audio_to_assemblyai(temp_audio_file)
+        if not audio_url:
+            status_placeholder.error("❌ Failed to upload audio to AssemblyAI")
+            return
         
         # Clean up temp file
         os.unlink(temp_audio_file)
@@ -274,10 +298,17 @@ def process_audio(audio_bytes):
         # Step 3: Request transcription
         status_placeholder.info("⏳ Requesting transcription...")
         transcript_id = request_transcription(audio_url)
+        if not transcript_id:
+            status_placeholder.error("❌ Failed to request transcription")
+            return
         
         # Step 4: Wait for transcription to complete
         status_placeholder.info("⏳ Processing audio transcription (this may take a moment)...")
         transcript_text = poll_transcription(transcript_id)
+        if not transcript_text:
+            status_placeholder.error("❌ Failed to retrieve transcription")
+            return
+            
         st.session_state.last_transcript = transcript_text
         
         # Display the transcript
@@ -314,34 +345,35 @@ def process_audio(audio_bytes):
 # --- Audio capture with streamlit-webrtc ---
 st.markdown('<div class="section"><h3>Audio Recording</h3></div>', unsafe_allow_html=True)
 
-# Function to concatenate audio frames
-def concat_frames(frames):
-    all_samples = []
-    for frame in frames:
-        samples = frame.to_ndarray().flatten()
-        all_samples.append(samples)
-    
-    if all_samples:
-        return np.concatenate(all_samples)
-    return np.array([])
+class AudioProcessor:
+    def __init__(self):
+        self.audio_buffer = queue.Queue()
+        
+    def recv(self, frame):
+        if st.session_state.recording:
+            sound = frame.to_ndarray().astype(np.float32)
+            self.audio_buffer.put(sound)
+        return frame
 
 # Create a status placeholder for recording status
 status_text = st.empty()
 if st.session_state.recording:
-    status_text.info("🔴 Recording in progress... Click 'Stop Recording' when done.")
+    status_text.info("🔴 Recording in progress...")
 else:
-    status_text.info("🎤 Click 'Start Recording' to begin.")
+    status_text.info("🎤 Ready to record")
 
-# Audio callback function
-def audio_callback(frame):
-    # Add audio frame to the buffer
-    if st.session_state.recording:
-        sound = frame.to_ndarray().astype(np.float32)
-        st.session_state.audio_buffer.put(sound)
-    return frame
+# Buttons to start/stop recording
+col1, col2 = st.columns(2)
+with col1:
+    start_button = st.button("▶️ Start Recording")
+with col2:
+    stop_button = st.button("⏹️ Stop Recording")
 
 # WebRTC Configuration
 rtc_configuration = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
+
+# Create audio processor
+audio_processor = AudioProcessor()
 
 # WebRTC Component
 webrtc_ctx = webrtc_streamer(
@@ -349,54 +381,50 @@ webrtc_ctx = webrtc_streamer(
     mode=WebRtcMode.SENDONLY,
     rtc_configuration=rtc_configuration,
     media_stream_constraints={"video": False, "audio": True},
-    audio_frame_callback=audio_callback,
+    video_processor_factory=None,
+    audio_processor_factory=lambda: audio_processor,
     async_processing=True,
 )
 
-# Check if WebRTC is started
-if webrtc_ctx.state.playing:
-    if not st.session_state.recording:
-        # Clear previous buffer when starting new recording
-        st.session_state.audio_buffer = queue.Queue()
-        st.session_state.recording = True
-        status_text.info("🔴 Recording started...")
-else:
-    # If WebRTC is stopped but recording was active
-    if st.session_state.recording:
-        st.session_state.recording = False
-        status_text.info("⏹️ Recording stopped. Processing audio...")
+# Handle button clicks
+if start_button and webrtc_ctx.state.playing:
+    st.session_state.recording = True
+    status_text.info("🔴 Recording started...")
+    
+if stop_button and st.session_state.recording:
+    st.session_state.recording = False
+    status_text.info("⏹️ Recording stopped. Processing audio...")
+    
+    # Process all audio from the buffer
+    frames = []
+    while not audio_processor.audio_buffer.empty():
+        try:
+            frames.append(audio_processor.audio_buffer.get_nowait())
+        except queue.Empty:
+            break
+    
+    if frames:
+        # Concatenate all frames
+        audio_data = np.concatenate(frames, axis=0)
         
-        # Process all audio frames in the buffer
-        frames = []
-        while not st.session_state.audio_buffer.empty():
-            try:
-                frames.append(st.session_state.audio_buffer.get_nowait())
-            except queue.Empty:
-                break
+        # Convert to int16 for WAV format
+        audio_int16 = (audio_data * 32767).astype(np.int16)
         
-        if frames:
-            # Concatenate all frames
-            audio_data = np.concatenate(frames, axis=0)
-            
-            # Convert to int16 for WAV format
-            audio_int16 = (audio_data * 32767).astype(np.int16)
-            
-            # Create a BytesIO object and save as WAV
-            import wave
-            buf = BytesIO()
-            with wave.open(buf, 'wb') as wf:
-                wf.setnchannels(CHANNELS)
-                wf.setsampwidth(2)  # 16-bit audio
-                wf.setframerate(SAMPLE_RATE)
-                wf.writeframes(audio_int16.tobytes())
-            
-            # Start processing the audio
-            if not st.session_state.processing:
-                st.session_state.processing = True
-                buf.seek(0)  # Go back to the start of the BytesIO buffer
-                process_audio(buf.read())
+        # Create a BytesIO object and save as WAV
+        buf = BytesIO()
+        with wave.open(buf, 'wb') as wf:
+            wf.setnchannels(CHANNELS)
+            wf.setsampwidth(2)  # 16-bit audio
+            wf.setframerate(SAMPLE_RATE)
+            wf.writeframes(audio_int16.tobytes())
+        
+        # Start processing the audio
+        if not st.session_state.processing:
+            st.session_state.processing = True
+            buf.seek(0)  # Go back to the start of the BytesIO buffer
+            process_audio(buf.read())
 
-# --- Manual Process and Test Buttons ---
+# --- Test Alert Button ---
 col1, col2 = st.columns(2)
 
 with col2:
@@ -420,9 +448,9 @@ with st.expander("📋 How to Use"):
        - Enter the recipient email for emergency alerts
     
     2. **Record Audio**:
-       - Click "Start" in the audio recorder to begin recording
+       - Click "Start Recording" to begin recording
        - Speak clearly into your microphone
-       - Click "Stop" when done to process the audio
+       - Click "Stop Recording" when done to process the audio
     
     3. **Monitor Results**:
        - The system will transcribe your speech
@@ -465,4 +493,3 @@ st.markdown(
     </div>""", 
     unsafe_allow_html=True
 )
-
