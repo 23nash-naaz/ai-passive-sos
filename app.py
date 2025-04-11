@@ -5,25 +5,13 @@ import streamlit as st
 import numpy as np
 import wave
 from email.mime.text import MIMEText
-from threading import Thread
 from io import BytesIO
 import os
 from pydub import AudioSegment
 import tempfile
 
 # === AssemblyAI Configuration ===
-# Store API key in secrets for security
-def get_api_key():
-    # Try to get from streamlit secrets first (preferred for deployment)
-    if 'ASSEMBLYAI_API_KEY' in st.secrets:
-        return st.secrets['ASSEMBLYAI_API_KEY']
-    # Fall back to environment variable
-    elif 'ASSEMBLYAI_API_KEY' in os.environ:
-        return os.environ['ASSEMBLYAI_API_KEY']
-    # Finally use the hardcoded value (not recommended for production)
-    else:
-        return "29f8ab7b44c64f58903439c9afe57ed4"  # Replace with your actual AssemblyAI API key
-
+ASSEMBLYAI_API_KEY = "29f8ab7b44c64f58903439c9afe57ed4"  # AssemblyAI API key directly integrated
 ASSEMBLYAI_UPLOAD_URL = "https://api.assemblyai.com/v2/upload"
 ASSEMBLYAI_TRANSCRIPT_URL = "https://api.assemblyai.com/v2/transcript"
 
@@ -36,10 +24,6 @@ CHUNK_DURATION = 5       # seconds per audio chunk
 DISTRESS_KEYWORDS = {"help", "sos", "emergency", "911", "save me", "distress", "assistance", "trapped", "danger"}
 
 # --- Session state initialization ---
-if 'recording' not in st.session_state:
-    st.session_state.recording = False
-if 'stop_due_to_distress' not in st.session_state:
-    st.session_state.stop_due_to_distress = False
 if 'last_transcript' not in st.session_state:
     st.session_state.last_transcript = ""
 if 'processing' not in st.session_state:
@@ -155,7 +139,7 @@ def get_email_credentials():
 
 def upload_audio_to_assemblyai(audio_data):
     """Upload audio data to AssemblyAI and return the audio URL."""
-    headers = {"authorization": get_api_key()}
+    headers = {"authorization": ASSEMBLYAI_API_KEY}
     
     # Send the audio data directly in the request
     response = requests.post(
@@ -169,7 +153,7 @@ def upload_audio_to_assemblyai(audio_data):
 def request_transcription(audio_url):
     """Request transcription from AssemblyAI."""
     headers = {
-        "authorization": get_api_key(), 
+        "authorization": ASSEMBLYAI_API_KEY, 
         "content-type": "application/json"
     }
     json_data = {"audio_url": audio_url}
@@ -179,7 +163,7 @@ def request_transcription(audio_url):
 
 def poll_transcription(transcript_id):
     """Poll AssemblyAI API until transcription is complete and return the text."""
-    headers = {"authorization": get_api_key()}
+    headers = {"authorization": ASSEMBLYAI_API_KEY}
     polling_url = f"{ASSEMBLYAI_TRANSCRIPT_URL}/{transcript_id}"
     
     for _ in range(30):  # Set a limit to prevent infinite polling
@@ -283,8 +267,6 @@ def process_audio(audio_data):
                     <p>An emergency notification has been sent to the designated contact.</p>
                 </div>
                 """, unsafe_allow_html=True)
-            
-            st.session_state.stop_due_to_distress = True
         else:
             status_placeholder.success("✅ Audio processed successfully. No distress detected.")
             
@@ -295,7 +277,6 @@ def process_audio(audio_data):
     st.session_state.processing = False
 
 # --- Streamlit Audio Recorder ---
-# Using Streamlit's built-in audio recorder for best compatibility
 st.markdown('<div class="section"><h3>Audio Recording</h3></div>', unsafe_allow_html=True)
 
 col1, col2 = st.columns(2)
