@@ -15,7 +15,10 @@ import logging
 import wave
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # === AssemblyAI Configuration ===
@@ -30,6 +33,14 @@ CHANNELS = 1         # mono audio
 # === Distress Keywords ===
 DISTRESS_KEYWORDS = {"help", "sos", "emergency", "911", "save me", "distress", "assistance", "trapped", "danger"}
 
+# --- Network connectivity check ---
+def check_connectivity():
+    try:
+        requests.get("https://www.google.com", timeout=5)
+        return True
+    except requests.exceptions.RequestException:
+        return False
+
 # --- Session state initialization ---
 if 'audio_frames' not in st.session_state:
     st.session_state.audio_frames = []
@@ -41,8 +52,8 @@ if 'last_transcript' not in st.session_state:
     st.session_state.last_transcript = ""
 if 'processing' not in st.session_state:
     st.session_state.processing = False
-if 'webrtc_ctx' not in st.session_state:
-    st.session_state.webrtc_ctx = None
+if 'connection_attempt' not in st.session_state:
+    st.session_state.connection_attempt = False
 
 # --- Custom CSS for Beautiful UI ---
 st.markdown(
@@ -104,6 +115,10 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# --- Check connectivity at startup ---
+if not check_connectivity():
+    st.error("❌ Network connectivity issue detected. Please check your internet connection.")
+
 # --- Page Title and Description ---
 st.markdown('<div class="header">AI Passive SOS</div>', unsafe_allow_html=True)
 st.markdown('<div class="subheader">Passive Listening. Automatic Alerts. Enhanced Safety.</div>', unsafe_allow_html=True)
@@ -135,12 +150,27 @@ with st.container():
         if email_service == "Gmail":
             smtp_server = "smtp.gmail.com"
             smtp_port = 587
+            st.info("⚠️ For Gmail: You must use an App Password, not your regular password.")
+            
+            with st.expander("Gmail App Password Instructions"):
+                st.markdown("""
+                1. Go to your [Google Account](https://myaccount.google.com/)
+                2. Select **Security**
+                3. Under "Signing in to Google," select **App Passwords** (you may need to enable 2-Step Verification first)
+                4. At the bottom, click **Select app** and choose **Other (Custom name)**
+                5. Enter "AI Passive SOS" and click **Generate**
+                6. Use the 16-character password shown on your screen
+                7. Click **Done**
+                """)
         elif email_service == "Outlook/Hotmail":
             smtp_server = "smtp.office365.com"
             smtp_port = 587
         elif email_service == "Yahoo":
             smtp_server = "smtp.mail.yahoo.com"
             smtp_port = 587
+            
+    if email_service != "Gmail":
+        st.info("Some email providers require enabling 'Less secure app access' in your account settings.")
 
 def get_email_credentials():
     """Return a dictionary with all email settings"""
@@ -154,16 +184,22 @@ def get_email_credentials():
 
 def save_audio_bytes(audio_bytes):
     """Save audio bytes to a temporary WAV file and return the filename."""
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-    temp_file.write(audio_bytes)
-    temp_file.close()
-    return temp_file.name
+    try:
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+        temp_file.write(audio_bytes)
+        temp_file.close()
+        logger.info(f"Audio saved to temporary file: {temp_file.name}")
+        return temp_file.name
+    except Exception as e:
+        logger.error(f"Error saving audio to temporary file: {str(e)}")
+        raise
 
 def upload_audio_to_assemblyai(audio_file_path):
     """Upload audio file to AssemblyAI and return the audio URL."""
     headers = {"authorization": ASSEMBLYAI_API_KEY}
     
     try:
+        logger.info(f"Uploading audio from {audio_file_path} to AssemblyAI")
         with open(audio_file_path, "rb") as f:
             response = requests.post(
                 ASSEMBLYAI_UPLOAD_URL,
@@ -172,12 +208,18 @@ def upload_audio_to_assemblyai(audio_file_path):
             )
         
         if response.status_code != 200:
-            st.error(f"Upload failed with status {response.status_code}: {response.text}")
+            error_msg = f"Upload failed with status {response.status_code}: {response.text}"
+            logger.error(error_msg)
+            st.error(error_msg)
             return None
             
-        return response.json()['upload_url']
+        upload_url = response.json()['upload_url']
+        logger.info(f"Audio uploaded successfully. URL: {upload_url}")
+        return upload_url
     except Exception as e:
-        st.error(f"Error uploading audio: {str(e)}")
+        error_msg = f"Error uploading audio: {str(e)}"
+        logger.error(error_msg)
+        st.error(error_msg)
         return None
 
 def request_transcription(audio_url):
@@ -189,15 +231,22 @@ def request_transcription(audio_url):
     json_data = {"audio_url": audio_url}
     
     try:
+        logger.info("Requesting transcription from AssemblyAI")
         response = requests.post(ASSEMBLYAI_TRANSCRIPT_URL, json=json_data, headers=headers)
         
         if response.status_code != 200:
-            st.error(f"Transcription request failed with status {response.status_code}: {response.text}")
+            error_msg = f"Transcription request failed with status {response.status_code}: {response.text}"
+            logger.error(error_msg)
+            st.error(error_msg)
             return None
             
-        return response.json()['id']
+        transcript_id = response.json()['id']
+        logger.info(f"Transcription requested successfully. ID: {transcript_id}")
+        return transcript_id
     except Exception as e:
-        st.error(f"Error requesting transcription: {str(e)}")
+        error_msg = f"Error requesting transcription: {str(e)}"
+        logger.error(error_msg)
+        st.error(error_msg)
         return None
 
 def poll_transcription(transcript_id):
@@ -206,27 +255,39 @@ def poll_transcription(transcript_id):
     polling_url = f"{ASSEMBLYAI_TRANSCRIPT_URL}/{transcript_id}"
     
     try:
-        for _ in range(30):  # Set a limit to prevent infinite polling
+        logger.info(f"Polling for transcription results: {transcript_id}")
+        for attempt in range(30):  # Set a limit to prevent infinite polling
+            logger.info(f"Polling attempt {attempt+1}/30")
             response = requests.get(polling_url, headers=headers)
             
             if response.status_code != 200:
-                st.error(f"Polling failed with status {response.status_code}: {response.text}")
+                error_msg = f"Polling failed with status {response.status_code}: {response.text}"
+                logger.error(error_msg)
+                st.error(error_msg)
                 return None
                 
             result = response.json()
             
             if result['status'] == 'completed':
-                return result['text'] or "No speech detected."
+                transcription = result['text'] or "No speech detected."
+                logger.info(f"Transcription completed: {transcription[:50]}...")
+                return transcription
             elif result['status'] == 'error':
-                st.error(f"Transcription error: {result.get('error', 'Unknown error')}")
+                error_msg = f"Transcription error: {result.get('error', 'Unknown error')}"
+                logger.error(error_msg)
+                st.error(error_msg)
                 return None
             
             time.sleep(2)  # Wait 2 seconds between polling attempts
         
-        st.warning("Transcription timed out after 60 seconds")
+        warning_msg = "Transcription timed out after 60 seconds"
+        logger.warning(warning_msg)
+        st.warning(warning_msg)
         return None
     except Exception as e:
-        st.error(f"Error polling transcription: {str(e)}")
+        error_msg = f"Error polling transcription: {str(e)}"
+        logger.error(error_msg)
+        st.error(error_msg)
         return None
 
 def contains_distress(text):
@@ -241,6 +302,11 @@ def contains_distress(text):
         if keyword in text_lower:
             found_keywords.append(keyword)
     
+    if found_keywords:
+        logger.info(f"Distress keywords detected: {', '.join(found_keywords)}")
+    else:
+        logger.info("No distress keywords detected in transcript")
+        
     return found_keywords
 
 def send_alert_email(transcript_text, keywords_found):
@@ -248,7 +314,9 @@ def send_alert_email(transcript_text, keywords_found):
     creds = get_email_credentials()
     
     if not (creds["username"] and creds["password"] and creds["recipient"]):
-        st.warning("⚠️ Please enter all email credentials before sending an alert.")
+        warning_msg = "⚠️ Please enter all email credentials before sending an alert."
+        logger.warning(warning_msg)
+        st.warning(warning_msg)
         return False
         
     subject = "🚨 SOS Alert: Distress Detected!"
@@ -267,13 +335,48 @@ This is an automated alert from AI Passive SOS.
     msg["To"] = creds["recipient"]
 
     try:
+        logger.info(f"Attempting to send email alert to {creds['recipient']}")
         with smtplib.SMTP(creds["smtp_server"], creds["smtp_port"]) as server:
-            server.starttls()
-            server.login(creds["username"], creds["password"])
-            server.sendmail(creds["username"], creds["recipient"], msg.as_string())
+            logger.info("Establishing connection with SMTP server")
+            server.ehlo()  # Identify to the SMTP server
+            logger.info("Starting TLS encryption")
+            server.starttls()  # Secure the connection
+            server.ehlo()  # Re-identify over TLS connection
+            
+            # Detailed authentication logging
+            try:
+                logger.info(f"Attempting login with username: {creds['username']}")
+                server.login(creds["username"], creds["password"])
+                logger.info("Email authentication successful")
+                st.info("✅ Email login successful")
+            except smtplib.SMTPAuthenticationError as auth_err:
+                error_msg = f"❌ Email authentication failed: {str(auth_err)}"
+                logger.error(error_msg)
+                st.error(error_msg)
+                if creds["smtp_server"] == "smtp.gmail.com":
+                    st.info("For Gmail, use an App Password instead of your regular password")
+                return False
+                
+            # Send with more detailed error reporting
+            try:
+                logger.info(f"Sending email from {creds['username']} to {creds['recipient']}")
+                server.sendmail(creds["username"], creds["recipient"], msg.as_string())
+                success_msg = "📧 Email sent successfully"
+                logger.info(success_msg)
+                st.success(success_msg)
+            except Exception as send_err:
+                error_msg = f"❌ Failed to send email: {str(send_err)}"
+                logger.error(error_msg)
+                st.error(error_msg)
+                return False
+                
         return True
+        
     except Exception as e:
-        st.error(f"❌ Failed to send email: {str(e)}")
+        error_msg = f"❌ Failed to connect to email server: {str(e)}"
+        logger.error(error_msg)
+        st.error(error_msg)
+        st.info("Check your SMTP server and port settings")
         return False
 
 def process_audio(audio_bytes):
@@ -293,7 +396,11 @@ def process_audio(audio_bytes):
             return
         
         # Clean up temp file
-        os.unlink(temp_audio_file)
+        try:
+            os.unlink(temp_audio_file)
+            logger.info(f"Temporary file removed: {temp_audio_file}")
+        except Exception as e:
+            logger.warning(f"Unable to remove temporary file: {str(e)}")
         
         # Step 3: Request transcription
         status_placeholder.info("⏳ Requesting transcription...")
@@ -333,12 +440,20 @@ def process_audio(audio_bytes):
                     <p>An emergency notification has been sent to the designated contact.</p>
                 </div>
                 """, unsafe_allow_html=True)
+            else:
+                st.markdown("""
+                <div class="status-box alert">
+                    <h3>⚠️ Failed to Send Alert</h3>
+                    <p>Please check your email configuration and try again.</p>
+                </div>
+                """, unsafe_allow_html=True)
         else:
             status_placeholder.success("✅ Audio processed successfully. No distress detected.")
             
     except Exception as e:
-        status_placeholder.error(f"❌ Error: {str(e)}")
-        st.error(f"Processing failed: {str(e)}")
+        error_msg = f"❌ Error: {str(e)}"
+        logger.error(error_msg)
+        status_placeholder.error(error_msg)
     finally:
         st.session_state.processing = False
 
@@ -369,8 +484,14 @@ with col1:
 with col2:
     stop_button = st.button("⏹️ Stop Recording")
 
-# WebRTC Configuration
-rtc_configuration = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
+# WebRTC Configuration - Enhanced with multiple STUN servers
+rtc_configuration = RTCConfiguration(
+    {"iceServers": [
+        {"urls": ["stun:stun.l.google.com:19302"]},
+        {"urls": ["stun:stun1.l.google.com:19302"]},
+        {"urls": ["stun:stun2.l.google.com:19302"]}
+    ]}
+)
 
 # Create audio processor
 audio_processor = AudioProcessor()
@@ -379,19 +500,42 @@ audio_processor = AudioProcessor()
 webrtc_ctx = webrtc_streamer(
     key="audio-recorder",
     mode=WebRtcMode.SENDONLY,
-    rtc_configuration=rtc_configuration,
+    rtc_configuration=rtc_configuration, 
     media_stream_constraints={"video": False, "audio": True},
     video_processor_factory=None,
     audio_processor_factory=lambda: audio_processor,
     async_processing=True,
 )
 
+# WebRTC connection status and troubleshooting
+if webrtc_ctx.state.playing:
+    st.success("✅ WebRTC connection established successfully")
+    st.session_state.connection_attempt = False
+else:
+    # If connection is taking too long, show troubleshooting info
+    if st.session_state.connection_attempt:
+        st.warning("⚠️ WebRTC connection is taking longer than expected. Try the following:")
+        st.markdown("""
+        - Check your internet connection
+        - Try disabling any VPN you might be using
+        - Ensure your browser has microphone permissions
+        - Try refreshing the page
+        - Try using a different browser (Chrome works best)
+        """)
+    st.session_state.connection_attempt = True
+
 # Handle button clicks
-if start_button and webrtc_ctx.state.playing:
-    st.session_state.recording = True
-    status_text.info("🔴 Recording started...")
+if start_button:
+    if webrtc_ctx.state.playing:
+        st.session_state.recording = True
+        status_text.info("🔴 Recording started...")
+        logger.info("Recording started")
+    else:
+        st.error("❌ Cannot start recording. WebRTC connection not established.")
+        logger.error("Failed to start recording - no WebRTC connection")
     
 if stop_button and st.session_state.recording:
+    logger.info("Recording stopped. Processing audio...")
     st.session_state.recording = False
     status_text.info("⏹️ Recording stopped. Processing audio...")
     
@@ -404,6 +548,7 @@ if stop_button and st.session_state.recording:
             break
     
     if frames:
+        logger.info(f"Processing {len(frames)} audio frames")
         # Concatenate all frames
         audio_data = np.concatenate(frames, axis=0)
         
@@ -423,6 +568,9 @@ if stop_button and st.session_state.recording:
             st.session_state.processing = True
             buf.seek(0)  # Go back to the start of the BytesIO buffer
             process_audio(buf.read())
+    else:
+        st.warning("⚠️ No audio recorded. Please try again.")
+        logger.warning("No audio frames collected during recording")
 
 # --- Test Alert Button ---
 col1, col2 = st.columns(2)
@@ -433,6 +581,7 @@ with col2:
         if not (email_username and email_password and recipient_email):
             st.warning("⚠️ Please fill in all email credentials before testing.")
         else:
+            logger.info("Sending test email alert")
             test_message = "This is a test alert from the AI Passive SOS system. If you received this message, the alert system is working properly."
             if send_alert_email(test_message, ["TEST ALERT"]):
                 st.success("✅ Test email sent successfully!")
@@ -464,15 +613,23 @@ with st.expander("⚙️ Troubleshooting"):
     st.markdown("""
     ### Troubleshooting
     
+    **"Taking a while to connect" Message**
+    - This is often caused by network issues or VPN interference
+    - Try disabling VPN services if you're using them
+    - Ensure you're allowing WebRTC connections in your browser
+    - Try a different network connection if available
+    
     **Browser Not Detecting Microphone**
     - Make sure your browser has permission to access your microphone
     - Try using Chrome or Edge for best compatibility
+    - Check browser settings (click the lock icon in address bar)
     - Refresh the page and try again
     
     **Email Alerts Not Sending**
     - For Gmail: Make sure you're using an App Password, not your regular password
     - Check that your email and password are entered correctly
     - Try the "Test Alert Email" button to verify your settings
+    - Check for any security settings that might be blocking the connection
     
     **Audio Processing Issues**
     - Speak clearly and avoid background noise
