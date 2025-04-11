@@ -3,12 +3,19 @@ import requests
 import smtplib
 import streamlit as st
 import numpy as np
-import wave
 from email.mime.text import MIMEText
 from io import BytesIO
 import os
-from pydub import AudioSegment
 import tempfile
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
+import av
+import queue
+import threading
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # === AssemblyAI Configuration ===
 ASSEMBLYAI_API_KEY = "29f8ab7b44c64f58903439c9afe57ed4"  # AssemblyAI API key directly integrated
@@ -16,14 +23,19 @@ ASSEMBLYAI_UPLOAD_URL = "https://api.assemblyai.com/v2/upload"
 ASSEMBLYAI_TRANSCRIPT_URL = "https://api.assemblyai.com/v2/transcript"
 
 # === Audio Configuration ===
-SAMPLE_RATE = 16000      # reduced sample rate for better web compatibility
+SAMPLE_RATE = 16000      # sample rate for better web compatibility
 CHANNELS = 1             # mono audio
-CHUNK_DURATION = 5       # seconds per audio chunk
 
 # === Distress Keywords ===
 DISTRESS_KEYWORDS = {"help", "sos", "emergency", "911", "save me", "distress", "assistance", "trapped", "danger"}
 
 # --- Session state initialization ---
+if 'audio_frames' not in st.session_state:
+    st.session_state.audio_frames = []
+if 'recording' not in st.session_state:
+    st.session_state.recording = False
+if 'audio_buffer' not in st.session_state:
+    st.session_state.audio_buffer = queue.Queue()
 if 'last_transcript' not in st.session_state:
     st.session_state.last_transcript = ""
 if 'processing' not in st.session_state:
@@ -137,17 +149,27 @@ def get_email_credentials():
         "smtp_port": smtp_port
     }
 
-def upload_audio_to_assemblyai(audio_data):
-    """Upload audio data to AssemblyAI and return the audio URL."""
+def save_audio_bytes(audio_bytes):
+    """Save audio bytes to a temporary WAV file and return the filename."""
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+    temp_file.write(audio_bytes)
+    temp_file.close()
+    return temp_file.name
+
+def upload_audio_to_assemblyai(audio_file_path):
+    """Upload audio file to AssemblyAI and return the audio URL."""
     headers = {"authorization": ASSEMBLYAI_API_KEY}
     
-    # Send the audio data directly in the request
-    response = requests.post(
-        ASSEMBLYAI_UPLOAD_URL,
-        headers=headers,
-        data=audio_data
-    )
-    response.raise_for_status()
+    with open(audio_file_path, "rb") as f:
+        response = requests.post(
+            ASSEMBLYAI_UPLOAD_URL,
+            headers=headers,
+            data=f
+        )
+    
+    if response.status_code != 200:
+        raise Exception(f"Upload failed with status {response.status_code}: {response.text}")
+        
     return response.json()['upload_url']
 
 def request_transcription(audio_url):
@@ -158,7 +180,10 @@ def request_transcription(audio_url):
     }
     json_data = {"audio_url": audio_url}
     response = requests.post(ASSEMBLYAI_TRANSCRIPT_URL, json=json_data, headers=headers)
-    response.raise_for_status()
+    
+    if response.status_code != 200:
+        raise Exception(f"Transcription request failed with status {response.status_code}: {response.text}")
+        
     return response.json()['id']
 
 def poll_transcription(transcript_id):
@@ -168,7 +193,10 @@ def poll_transcription(transcript_id):
     
     for _ in range(30):  # Set a limit to prevent infinite polling
         response = requests.get(polling_url, headers=headers)
-        response.raise_for_status()
+        
+        if response.status_code != 200:
+            raise Exception(f"Polling failed with status {response.status_code}: {response.text}")
+            
         result = response.json()
         
         if result['status'] == 'completed':
@@ -227,20 +255,27 @@ This is an automated alert from AI Passive SOS.
         st.error(f"❌ Failed to send email: {str(e)}")
         return False
 
-def process_audio(audio_data):
-    """Process audio: upload, transcribe, detect distress, and send an alert if needed."""
+def process_audio(audio_bytes):
+    """Process audio: save, upload, transcribe, detect distress, and send an alert if needed."""
     status_placeholder = st.empty()
     
     try:
-        # Step 1: Upload to AssemblyAI
-        status_placeholder.info("🔄 Uploading audio to transcription service...")
-        audio_url = upload_audio_to_assemblyai(audio_data)
+        # Step 1: Save audio to temp file
+        status_placeholder.info("💾 Saving audio recording...")
+        temp_audio_file = save_audio_bytes(audio_bytes)
         
-        # Step 2: Request transcription
+        # Step 2: Upload to AssemblyAI
+        status_placeholder.info("🔄 Uploading audio to transcription service...")
+        audio_url = upload_audio_to_assemblyai(temp_audio_file)
+        
+        # Clean up temp file
+        os.unlink(temp_audio_file)
+        
+        # Step 3: Request transcription
         status_placeholder.info("⏳ Requesting transcription...")
         transcript_id = request_transcription(audio_url)
         
-        # Step 3: Wait for transcription to complete
+        # Step 4: Wait for transcription to complete
         status_placeholder.info("⏳ Processing audio transcription (this may take a moment)...")
         transcript_text = poll_transcription(transcript_id)
         st.session_state.last_transcript = transcript_text
@@ -249,7 +284,7 @@ def process_audio(audio_data):
         st.markdown("### 📝 Transcript:")
         st.write(transcript_text or "No speech detected")
         
-        # Step 4: Check for distress keywords
+        # Step 5: Check for distress keywords
         distress_keywords = contains_distress(transcript_text)
         if distress_keywords:
             st.markdown(f"""
@@ -259,7 +294,7 @@ def process_audio(audio_data):
             </div>
             """, unsafe_allow_html=True)
             
-            # Step 5: Send alert if distress detected
+            # Step 6: Send alert if distress detected
             if send_alert_email(transcript_text, distress_keywords):
                 st.markdown("""
                 <div class="status-box success">
@@ -273,22 +308,96 @@ def process_audio(audio_data):
     except Exception as e:
         status_placeholder.error(f"❌ Error: {str(e)}")
         st.error(f"Processing failed: {str(e)}")
-    
-    st.session_state.processing = False
+    finally:
+        st.session_state.processing = False
 
-# --- Streamlit Audio Recorder ---
+# --- Audio capture with streamlit-webrtc ---
 st.markdown('<div class="section"><h3>Audio Recording</h3></div>', unsafe_allow_html=True)
 
-col1, col2 = st.columns(2)
+# Function to concatenate audio frames
+def concat_frames(frames):
+    all_samples = []
+    for frame in frames:
+        samples = frame.to_ndarray().flatten()
+        all_samples.append(samples)
+    
+    if all_samples:
+        return np.concatenate(all_samples)
+    return np.array([])
 
-with col1:
-    # Record button
-    audio_bytes = st.audio_recorder(
-        text="Click to record", 
-        recording_color="#4B0082",
-        neutral_color="#6A0DAD",
-        sample_rate=SAMPLE_RATE,
-    )
+# Create a status placeholder for recording status
+status_text = st.empty()
+if st.session_state.recording:
+    status_text.info("🔴 Recording in progress... Click 'Stop Recording' when done.")
+else:
+    status_text.info("🎤 Click 'Start Recording' to begin.")
+
+# Audio callback function
+def audio_callback(frame):
+    # Add audio frame to the buffer
+    if st.session_state.recording:
+        sound = frame.to_ndarray().astype(np.float32)
+        st.session_state.audio_buffer.put(sound)
+    return frame
+
+# WebRTC Configuration
+rtc_configuration = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
+
+# WebRTC Component
+webrtc_ctx = webrtc_streamer(
+    key="audio-recorder",
+    mode=WebRtcMode.SENDONLY,
+    rtc_configuration=rtc_configuration,
+    media_stream_constraints={"video": False, "audio": True},
+    audio_frame_callback=audio_callback,
+    async_processing=True,
+)
+
+# Check if WebRTC is started
+if webrtc_ctx.state.playing:
+    if not st.session_state.recording:
+        # Clear previous buffer when starting new recording
+        st.session_state.audio_buffer = queue.Queue()
+        st.session_state.recording = True
+        status_text.info("🔴 Recording started...")
+else:
+    # If WebRTC is stopped but recording was active
+    if st.session_state.recording:
+        st.session_state.recording = False
+        status_text.info("⏹️ Recording stopped. Processing audio...")
+        
+        # Process all audio frames in the buffer
+        frames = []
+        while not st.session_state.audio_buffer.empty():
+            try:
+                frames.append(st.session_state.audio_buffer.get_nowait())
+            except queue.Empty:
+                break
+        
+        if frames:
+            # Concatenate all frames
+            audio_data = np.concatenate(frames, axis=0)
+            
+            # Convert to int16 for WAV format
+            audio_int16 = (audio_data * 32767).astype(np.int16)
+            
+            # Create a BytesIO object and save as WAV
+            import wave
+            buf = BytesIO()
+            with wave.open(buf, 'wb') as wf:
+                wf.setnchannels(CHANNELS)
+                wf.setsampwidth(2)  # 16-bit audio
+                wf.setframerate(SAMPLE_RATE)
+                wf.writeframes(audio_int16.tobytes())
+            
+            # Start processing the audio
+            if not st.session_state.processing:
+                st.session_state.processing = True
+                buf.seek(0)  # Go back to the start of the BytesIO buffer
+                process_audio(buf.read())
+
+# --- Manual Process and Test Buttons ---
+col1, col2 = st.columns(2)
 
 with col2:
     # Test alert button
@@ -299,28 +408,6 @@ with col2:
             test_message = "This is a test alert from the AI Passive SOS system. If you received this message, the alert system is working properly."
             if send_alert_email(test_message, ["TEST ALERT"]):
                 st.success("✅ Test email sent successfully!")
-
-# Process the recorded audio
-if audio_bytes and not st.session_state.processing:
-    st.session_state.processing = True
-    
-    # Convert the audio bytes to format compatible with AssemblyAI
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_audio:
-        temp_audio.write(audio_bytes)
-    
-    # Load with pydub and export as proper WAV format
-    audio = AudioSegment.from_file(temp_audio.name)
-    
-    # Export as WAV to a BytesIO object
-    buf = BytesIO()
-    audio.export(buf, format="wav")
-    buf.seek(0)
-    
-    # Remove the temp file
-    os.unlink(temp_audio.name)
-    
-    # Process the audio
-    process_audio(buf.read())
 
 # --- Instructions Section ---
 with st.expander("📋 How to Use"):
@@ -333,9 +420,9 @@ with st.expander("📋 How to Use"):
        - Enter the recipient email for emergency alerts
     
     2. **Record Audio**:
-       - Click the record button to start recording
+       - Click "Start" in the audio recorder to begin recording
        - Speak clearly into your microphone
-       - Click again to stop recording and process the audio
+       - Click "Stop" when done to process the audio
     
     3. **Monitor Results**:
        - The system will transcribe your speech
@@ -363,6 +450,11 @@ with st.expander("⚙️ Troubleshooting"):
     - Speak clearly and avoid background noise
     - Make sure your recording is at least 1-2 seconds long
     - If transcription fails, try recording again
+    
+    **Microphone Not Working**
+    - Allow microphone permissions in your browser
+    - Try closing other applications that might be using the microphone
+    - Ensure your microphone is properly connected and selected in your system settings
     """)
 
 # Footer
