@@ -1,6 +1,4 @@
-streamlit
-requests 
-imageio-ffmpeg
-numpy
-av
-gunicorn
+ streamlit
+ numpy
+requests
+ pydub
