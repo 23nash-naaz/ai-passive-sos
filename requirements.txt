@@ -3,4 +3,5 @@ uvicorn
 requests
 numpy
 python-multipart
+streamlit
 
