@@ -1,4 +1,3 @@
-
 import time
 import requests
 import smtplib
@@ -18,13 +17,13 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 
 # === AssemblyAI Configuration ===
-ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY", "29f8ab7b44c64f58903439c9afe57ed4")  # Set your actual key via env var
+ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY", "29f8ab7b44c64f58903439c9afe57ed4")
 ASSEMBLYAI_UPLOAD_URL = "https://api.assemblyai.com/v2/upload"
 ASSEMBLYAI_TRANSCRIPT_URL = "https://api.assemblyai.com/v2/transcript"
 
 # === Audio Configuration ===
-SAMPLE_RATE = 44100       # in Hz
-CHANNELS = 1              # mono audio
+SAMPLE_RATE = 44100
+CHANNELS = 1
 
 # === Distress Keywords ===
 DISTRESS_KEYWORDS = {
@@ -39,12 +38,11 @@ RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL", "recipient@example.com")
 # ------ Utility Functions ------
 
 def save_audio_file(audio_bytes: bytes) -> str:
-    """Save audio bytes to a temporary WAV file and return its file path."""
     try:
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
         with wave.open(temp_file, "wb") as wf:
             wf.setnchannels(CHANNELS)
-            wf.setsampwidth(2)  # 16-bit (2 bytes per sample)
+            wf.setsampwidth(2)
             wf.setframerate(SAMPLE_RATE)
             wf.writeframes(audio_bytes)
         temp_file.close()
@@ -55,7 +53,6 @@ def save_audio_file(audio_bytes: bytes) -> str:
         raise
 
 def upload_audio_to_assemblyai(file_path: str) -> str:
-    """Upload the audio file to AssemblyAI and return the uploaded audio URL."""
     headers = {"authorization": ASSEMBLYAI_API_KEY}
     with open(file_path, "rb") as f:
         response = requests.post(ASSEMBLYAI_UPLOAD_URL, headers=headers, data=f)
@@ -68,7 +65,6 @@ def upload_audio_to_assemblyai(file_path: str) -> str:
     return upload_url
 
 def request_transcription(audio_url: str) -> str:
-    """Request a transcription from AssemblyAI and return the transcript ID."""
     headers = {"authorization": ASSEMBLYAI_API_KEY, "content-type": "application/json"}
     json_data = {"audio_url": audio_url}
     response = requests.post(ASSEMBLYAI_TRANSCRIPT_URL, json=json_data, headers=headers)
@@ -81,10 +77,9 @@ def request_transcription(audio_url: str) -> str:
     return transcript_id
 
 def poll_transcription(transcript_id: str) -> str:
-    """Poll AssemblyAI until the transcription is complete and return the transcribed text."""
     headers = {"authorization": ASSEMBLYAI_API_KEY}
     polling_url = f"{ASSEMBLYAI_TRANSCRIPT_URL}/{transcript_id}"
-    for _ in range(30):  # try for roughly 90 seconds
+    for _ in range(30):
         response = requests.get(polling_url, headers=headers)
         if response.status_code != 200:
             msg = f"Polling failed: {response.status_code} - {response.text}"
@@ -104,7 +99,6 @@ def poll_transcription(transcript_id: str) -> str:
     raise HTTPException(status_code=504, detail="Transcription timed out.")
 
 def contains_distress(text: str) -> bool:
-    """Return True if any distress keyword is found in the text."""
     text_lower = text.lower()
     for keyword in DISTRESS_KEYWORDS:
         if keyword in text_lower:
@@ -113,7 +107,6 @@ def contains_distress(text: str) -> bool:
     return False
 
 def send_alert_email(transcript_text: str):
-    """Send an SOS alert email with the transcript text."""
     if not (EMAIL_USERNAME and EMAIL_PASSWORD and RECIPIENT_EMAIL):
         logger.warning("Email credentials are missing.")
         raise Exception("Email credentials are not set.")
@@ -136,15 +129,6 @@ def send_alert_email(transcript_text: str):
         raise
 
 def process_audio_file(audio_bytes: bytes) -> dict:
-    """
-    Process the given audio:
-      1. Save as a temporary file.
-      2. Upload to AssemblyAI.
-      3. Request transcription and poll for results.
-      4. Check transcription for distress keywords.
-      5. Send an alert email if distress is detected.
-    Returns a dictionary with the transcript and alert status.
-    """
     temp_audio_path = save_audio_file(audio_bytes)
     try:
         audio_url = upload_audio_to_assemblyai(temp_audio_path)
@@ -164,6 +148,14 @@ def process_audio_file(audio_bytes: bytes) -> dict:
 
 # ------ FastAPI Endpoints ------
 
+@app.get("/")
+def root():
+    return {"message": "🎧 Audio Processing API is live!"}
+
+@app.get("/status")
+def status_endpoint():
+    return {"status": "running"}
+
 @app.post("/process_audio")
 async def process_audio_endpoint(file: UploadFile = File(...)):
     try:
@@ -174,9 +166,8 @@ async def process_audio_endpoint(file: UploadFile = File(...)):
         logger.error("Error processing audio: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/status")
-def status_endpoint():
-    return {"status": "running"}
-
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+   
+
