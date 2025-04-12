@@ -3,5 +3,4 @@ uvicorn
 requests
 numpy
 python-multipart
-streamlit   # if needed for local testing, not required for API only
 
