@@ -12,8 +12,21 @@ import logging
 import wave
 import threading
 import queue
-import sounddevice as sd
-from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration, ClientSettings
+try:
+    import sounddevice as sd
+    SOUNDDEVICE_AVAILABLE = True
+except OSError:
+    # PortAudio not found, disable direct recording features
+    SOUNDDEVICE_AVAILABLE = False
+    print("PortAudio library not found. Direct recording features will be disabled.")
+
+try:
+    from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration, ClientSettings
+    WEBRTC_AVAILABLE = True
+except ImportError:
+    WEBRTC_AVAILABLE = False
+    print("streamlit_webrtc module not found. WebRTC features will be disabled.")
+
 from werkzeug.utils import secure_filename
 
 # Configure logging
@@ -465,18 +478,23 @@ def process_audio(audio_bytes):
 # --- Choose recording method ---
 st.markdown('<div class="section"><h3>Audio Recording</h3></div>', unsafe_allow_html=True)
 
+# Check for available recording methods
+available_methods = ["File Upload"]
+if WEBRTC_AVAILABLE and SOUNDDEVICE_AVAILABLE:
+    available_methods.append("Browser Microphone (WebRTC)")
+
 # Create a radio button to select the input method
 st.markdown('<div class="method-selector">', unsafe_allow_html=True)
 input_method = st.radio(
     "Choose recording method:",
-    ["File Upload", "Browser Microphone (WebRTC)"],
-    index=1,
-    help="If WebRTC doesn't work, try using file upload instead"
+    available_methods,
+    index=0,  # Default to file upload which is more reliable
+    help="File upload is the most reliable option across all environments"
 )
 st.markdown('</div>', unsafe_allow_html=True)
 
 # --- File Uploader Option ---
-if input_method == "File Upload":
+if input_method == "File Upload" or len(available_methods) == 1:
     st.session_state.using_file_upload = True
     
     st.write("Upload an audio file for processing:")
@@ -492,7 +510,7 @@ if input_method == "File Upload":
                 process_audio(audio_bytes)
 
 # --- WebRTC Option ---
-elif input_method == "Browser Microphone (WebRTC)":
+elif input_method == "Browser Microphone (WebRTC)" and WEBRTC_AVAILABLE and SOUNDDEVICE_AVAILABLE:
     st.session_state.using_file_upload = False
     
     # Create a status placeholder for recording status
@@ -653,6 +671,11 @@ elif input_method == "Browser Microphone (WebRTC)":
         st.info("🔄 Switching to file upload mode due to WebRTC initialization error...")
         st.session_state.using_file_upload = True
         st.experimental_rerun()
+# If neither WebRTC nor sounddevice is available
+else:
+    st.warning("⚠️ Browser microphone recording is not available in this environment due to missing dependencies.")
+    st.info("Please use the File Upload option instead.")
+    st.session_state.using_file_upload = True
 
 # --- Test Alert Button ---
 col1, col2 = st.columns(2)
@@ -716,16 +739,89 @@ with st.expander("⚙️ Troubleshooting"):
     - Make sure your recording is at least 1-2 seconds long
     - If transcription fails, try recording again
     
-    **Render Deployment Issues**
-    - Try using the File Upload option which is more reliable on hosted platforms
-    - Check that all required dependencies are included in requirements.txt
+    **Deployment Issues**
+    - If direct microphone recording isn't available, the application will automatically
+      show only the File Upload option
+    - Try uploading pre-recorded audio files, which works in all environments
+    """)
+
+# --- Render.yaml Configuration Notice ---
+with st.expander("🔧 Deployment Configuration"):
+    st.markdown("""
+    ### Render.yaml Configuration
+    
+    If you're deploying on Render, create a `render.yaml` file in your project root with the following content:
+    
+    ```yaml
+    services:
+      - type: web
+        name: ai-passive-sos
+        env: python
+        buildCommand: pip install -r requirements.txt
+        startCommand: streamlit run app.py
+        envVars:
+          - key: PYTHON_VERSION
+            value: 3.11
+        packages:
+          - portaudio19-dev
+          - python3-pyaudio
+    ```
+    
+    This will install the necessary system dependencies for audio recording functionality.
     """)
 
 # Footer
 st.markdown("---")
 st.markdown(
-    """<div style="text-align: center; color: #666;">
-    AI Passive SOS | Safety Through Technology | v1.2
-    </div>""", 
+    """<div style="text-align: center; margin-top: 2rem; opacity: 0.7;">
+        <p>AI Passive SOS | Enhanced Personal Safety System</p>
+        <p>Created with ❤️ by the AI Passive SOS Team</p>
+        <small>Powered by AssemblyAI for speech transcription</small>
+    </div>
+    """,
     unsafe_allow_html=True
 )
+
+# --- Extended testing and diagnostics (optional section) ---
+if st.checkbox("Show Debug Information"):
+    with st.expander("System Diagnostics"):
+        st.write("### System Status")
+        
+        # Check internet connectivity
+        internet_status = "Connected" if check_connectivity() else "Disconnected"
+        st.write(f"🌐 Internet Connection: {internet_status}")
+        
+        # Check AssemblyAI API connectivity
+        try:
+            response = requests.get(
+                "https://api.assemblyai.com/v2/transcript", 
+                headers={"authorization": ASSEMBLYAI_API_KEY}
+            )
+            api_status = "Connected" if response.status_code == 200 else f"Error: Status {response.status_code}"
+        except Exception as e:
+            api_status = f"Error: {str(e)}"
+        st.write(f"🔌 AssemblyAI API: {api_status}")
+        
+        # Check available recording methods
+        st.write("🎙️ Available Recording Methods:")
+        st.write(f"- Direct Recording via sounddevice: {'Available' if SOUNDDEVICE_AVAILABLE else 'Not Available'}")
+        st.write(f"- WebRTC Recording: {'Available' if WEBRTC_AVAILABLE else 'Not Available'}")
+        st.write(f"- File Upload: Always Available")
+        
+        # Show recent transcript
+        if st.session_state.last_transcript:
+            st.write("### Last Transcript")
+            st.text_area("Text", st.session_state.last_transcript, height=150)
+            
+        # Clear session state button
+        if st.button("Clear Session State"):
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            st.success("Session state cleared!")
+            initialize_session_state()
+
+# --- Prevent webcam from automatically starting ---
+if 'has_initialized' not in st.session_state:
+    st.session_state.has_initialized = True
+    # Force a rerun to prevent auto-start of camera
+    st.experimental_rerun()
