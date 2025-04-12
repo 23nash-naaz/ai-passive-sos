@@ -4,9 +4,12 @@ services:
     env: python
     buildCommand: pip install -r requirements.txt
     startCommand: streamlit run app.py
+    plan: free
     envVars:
       - key: PYTHON_VERSION
         value: 3.11
     packages:
       - portaudio19-dev
       - python3-pyaudio
+      - ffmpeg
+      - libavcodec-extra
