@@ -1,3 +1,4 @@
+
 import time
 import requests
 import smtplib
@@ -7,25 +8,34 @@ from email.mime.text import MIMEText
 from io import BytesIO
 import os
 import tempfile
-import av
 import logging
 import wave
 import threading
 import queue
+
+# Use a flag to check if sounddevice should be imported
+SOUNDDEVICE_AVAILABLE = False
 try:
     import sounddevice as sd
     SOUNDDEVICE_AVAILABLE = True
-except OSError:
-    # PortAudio not found, disable direct recording features
-    SOUNDDEVICE_AVAILABLE = False
-    print("PortAudio library not found. Direct recording features will be disabled.")
+except (ImportError, OSError):
+    # PortAudio not found or sounddevice not installed, disable direct recording features
+    print("sounddevice module not found. Direct recording features will be disabled.")
 
+# Use a flag to check if streamlit_webrtc should be imported
+WEBRTC_AVAILABLE = False
 try:
     from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration, ClientSettings
     WEBRTC_AVAILABLE = True
 except ImportError:
-    WEBRTC_AVAILABLE = False
     print("streamlit_webrtc module not found. WebRTC features will be disabled.")
+
+try:
+    import av
+    AV_AVAILABLE = True
+except ImportError:
+    AV_AVAILABLE = False
+    print("av module not found. Some audio processing features may be limited.")
 
 from werkzeug.utils import secure_filename
 
@@ -480,23 +490,27 @@ st.markdown('<div class="section"><h3>Audio Recording</h3></div>', unsafe_allow_
 
 # Check for available recording methods
 available_methods = ["File Upload"]
-if WEBRTC_AVAILABLE and SOUNDDEVICE_AVAILABLE:
+if WEBRTC_AVAILABLE and SOUNDDEVICE_AVAILABLE and AV_AVAILABLE:
     available_methods.append("Browser Microphone (WebRTC)")
 
-# Create a radio button to select the input method
-st.markdown('<div class="method-selector">', unsafe_allow_html=True)
-input_method = st.radio(
-    "Choose recording method:",
-    available_methods,
-    index=0,  # Default to file upload which is more reliable
-    help="File upload is the most reliable option across all environments"
-)
-st.markdown('</div>', unsafe_allow_html=True)
+# Force file upload only mode if dependencies are missing
+st.session_state.using_file_upload = True
+
+# Create a radio button to select the input method if we have options
+if len(available_methods) > 1:
+    st.markdown('<div class="method-selector">', unsafe_allow_html=True)
+    input_method = st.radio(
+        "Choose recording method:",
+        available_methods,
+        index=0,  # Default to file upload which is more reliable
+        help="File upload is the most reliable option across all environments"
+    )
+    st.markdown('</div>', unsafe_allow_html=True)
+else:
+    st.info("🔍 Only file upload is available in this environment. Some dependencies for real-time audio recording are missing.")
 
 # --- File Uploader Option ---
-if input_method == "File Upload" or len(available_methods) == 1:
-    st.session_state.using_file_upload = True
-    
+if st.session_state.using_file_upload or len(available_methods) == 1:
     st.write("Upload an audio file for processing:")
     uploaded_file = st.file_uploader("Choose an audio file", type=['wav', 'mp3', 'm4a', 'ogg'])
     
@@ -510,7 +524,7 @@ if input_method == "File Upload" or len(available_methods) == 1:
                 process_audio(audio_bytes)
 
 # --- WebRTC Option ---
-elif input_method == "Browser Microphone (WebRTC)" and WEBRTC_AVAILABLE and SOUNDDEVICE_AVAILABLE:
+elif input_method == "Browser Microphone (WebRTC)" and WEBRTC_AVAILABLE and SOUNDDEVICE_AVAILABLE and AV_AVAILABLE:
     st.session_state.using_file_upload = False
     
     # Create a status placeholder for recording status
@@ -713,6 +727,7 @@ with st.expander("📋 How to Use"):
     4. **Distress Keywords**:
        The system listens for: help, sos, emergency, 911, save me, distress, assistance, trapped, danger
     """)
+
 
 with st.expander("⚙️ Troubleshooting"):
     st.markdown("""
