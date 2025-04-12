@@ -5,6 +5,7 @@ sounddevice
 soundfile
 SpeechRecognition
 requests
+streamlit
 gunicorn
 
 
