@@ -1,7 +1,19 @@
 streamlit
-streamlit-webrtc
 numpy
 requests
-sounddevice
-av
+python-dotenv
 werkzeug
+
+# Audio processing
+sounddevice
+soundfile
+av
+
+# WebRTC support
+streamlit-webrtc
+
+# Logging
+logging
+
+# For deployment on Render
+PyAudio
