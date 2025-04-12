@@ -1,7 +1,10 @@
-fastapi
-uvicorn
-requests
+Flask
+flask-cors
 numpy
-python-multipart
-streamlit
+sounddevice
+soundfile
+SpeechRecognition
+requests
+gunicorn
+
 
