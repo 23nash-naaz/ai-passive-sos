@@ -7,12 +7,15 @@ from email.mime.text import MIMEText
 from io import BytesIO
 import os
 import tempfile
-from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 import av
-import queue
-import threading
 import logging
 import wave
+import threading
+import queue
+import asyncio
+from aiortc.contrib.media import MediaRecorder, MediaBlackhole
+from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 
 # Configure logging
 logging.basicConfig(
@@ -42,18 +45,23 @@ def check_connectivity():
         return False
 
 # --- Session state initialization ---
-if 'audio_frames' not in st.session_state:
-    st.session_state.audio_frames = []
-if 'recording' not in st.session_state:
-    st.session_state.recording = False
-if 'audio_buffer' not in st.session_state:
-    st.session_state.audio_buffer = queue.Queue()
-if 'last_transcript' not in st.session_state:
-    st.session_state.last_transcript = ""
-if 'processing' not in st.session_state:
-    st.session_state.processing = False
-if 'connection_attempt' not in st.session_state:
-    st.session_state.connection_attempt = False
+def initialize_session_state():
+    if 'audio_frames' not in st.session_state:
+        st.session_state.audio_frames = []
+    if 'recording' not in st.session_state:
+        st.session_state.recording = False
+    if 'audio_buffer' not in st.session_state:
+        st.session_state.audio_buffer = queue.Queue()
+    if 'last_transcript' not in st.session_state:
+        st.session_state.last_transcript = ""
+    if 'processing' not in st.session_state:
+        st.session_state.processing = False
+    if 'connection_attempt' not in st.session_state:
+        st.session_state.connection_attempt = False
+    if 'webrtc_ctx' not in st.session_state:
+        st.session_state.webrtc_ctx = None
+
+initialize_session_state()
 
 # --- Custom CSS for Beautiful UI ---
 st.markdown(
@@ -114,10 +122,6 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-
-# --- Check connectivity at startup ---
-if not check_connectivity():
-    st.error("❌ Network connectivity issue detected. Please check your internet connection.")
 
 # --- Page Title and Description ---
 st.markdown('<div class="header">AI Passive SOS</div>', unsafe_allow_html=True)
@@ -207,12 +211,7 @@ def upload_audio_to_assemblyai(audio_file_path):
                 data=f
             )
         
-        if response.status_code != 200:
-            error_msg = f"Upload failed with status {response.status_code}: {response.text}"
-            logger.error(error_msg)
-            st.error(error_msg)
-            return None
-            
+        response.raise_for_status()  # Raise exception for non-200 status codes
         upload_url = response.json()['upload_url']
         logger.info(f"Audio uploaded successfully. URL: {upload_url}")
         return upload_url
@@ -234,12 +233,7 @@ def request_transcription(audio_url):
         logger.info("Requesting transcription from AssemblyAI")
         response = requests.post(ASSEMBLYAI_TRANSCRIPT_URL, json=json_data, headers=headers)
         
-        if response.status_code != 200:
-            error_msg = f"Transcription request failed with status {response.status_code}: {response.text}"
-            logger.error(error_msg)
-            st.error(error_msg)
-            return None
-            
+        response.raise_for_status()  # Raise exception for non-200 status codes
         transcript_id = response.json()['id']
         logger.info(f"Transcription requested successfully. ID: {transcript_id}")
         return transcript_id
@@ -256,20 +250,19 @@ def poll_transcription(transcript_id):
     
     try:
         logger.info(f"Polling for transcription results: {transcript_id}")
-        for attempt in range(30):  # Set a limit to prevent infinite polling
-            logger.info(f"Polling attempt {attempt+1}/30")
+        
+        # Maximum number of attempts (60 seconds * 30 = 30 minutes maximum wait time)
+        max_attempts = 30
+        
+        for attempt in range(max_attempts):
+            logger.info(f"Polling attempt {attempt+1}/{max_attempts}")
             response = requests.get(polling_url, headers=headers)
             
-            if response.status_code != 200:
-                error_msg = f"Polling failed with status {response.status_code}: {response.text}"
-                logger.error(error_msg)
-                st.error(error_msg)
-                return None
-                
+            response.raise_for_status()  # Raise exception for non-200 status codes
             result = response.json()
             
             if result['status'] == 'completed':
-                transcription = result['text'] or "No speech detected."
+                transcription = result['text'] if result['text'] else "No speech detected."
                 logger.info(f"Transcription completed: {transcription[:50]}...")
                 return transcription
             elif result['status'] == 'error':
@@ -278,9 +271,11 @@ def poll_transcription(transcript_id):
                 st.error(error_msg)
                 return None
             
-            time.sleep(2)  # Wait 2 seconds between polling attempts
+            # Exponential backoff (2^attempt seconds, max 10 seconds)
+            wait_time = min(2 ** attempt, 10)
+            time.sleep(wait_time)
         
-        warning_msg = "Transcription timed out after 60 seconds"
+        warning_msg = f"Transcription timed out after {max_attempts} attempts"
         logger.warning(warning_msg)
         st.warning(warning_msg)
         return None
@@ -457,18 +452,29 @@ def process_audio(audio_bytes):
     finally:
         st.session_state.processing = False
 
-# --- Audio capture with streamlit-webrtc ---
+# --- Improved audio capture with streamlit-webrtc ---
 st.markdown('<div class="section"><h3>Audio Recording</h3></div>', unsafe_allow_html=True)
 
+# Create a custom audio processor that will work better with Render
 class AudioProcessor:
     def __init__(self):
-        self.audio_buffer = queue.Queue()
+        self.frames = []
+        self.audio_lock = threading.Lock()
         
     def recv(self, frame):
-        if st.session_state.recording:
-            sound = frame.to_ndarray().astype(np.float32)
-            self.audio_buffer.put(sound)
+        """Process each audio frame"""
+        with self.audio_lock:
+            if st.session_state.recording:
+                sound = frame.to_ndarray().astype(np.float32)
+                self.frames.append(sound)
         return frame
+    
+    def get_frames(self):
+        """Get current frames and clear buffer"""
+        with self.audio_lock:
+            result = self.frames
+            self.frames = []
+        return result
 
 # Create a status placeholder for recording status
 status_text = st.empty()
@@ -489,44 +495,77 @@ rtc_configuration = RTCConfiguration(
     {"iceServers": [
         {"urls": ["stun:stun.l.google.com:19302"]},
         {"urls": ["stun:stun1.l.google.com:19302"]},
-        {"urls": ["stun:stun2.l.google.com:19302"]}
+        {"urls": ["stun:stun2.l.google.com:19302"]},
+        # Add additional fallback STUN servers
+        {"urls": ["stun:stun.cloudflare.com:3478"]},
+        {"urls": ["stun:stun.stunprotocol.org:3478"]}
     ]}
 )
 
 # Create audio processor
 audio_processor = AudioProcessor()
 
-# WebRTC Component
-webrtc_ctx = webrtc_streamer(
-    key="audio-recorder",
-    mode=WebRtcMode.SENDONLY,
-    rtc_configuration=rtc_configuration, 
-    media_stream_constraints={"video": False, "audio": True},
-    video_processor_factory=None,
-    audio_processor_factory=lambda: audio_processor,
-    async_processing=True,
-)
+# Enhanced WebRTC component with more diagnostics
+try:
+    webrtc_ctx = webrtc_streamer(
+        key="improved-audio-recorder",
+        mode=WebRtcMode.SENDONLY,
+        rtc_configuration=rtc_configuration, 
+        media_stream_constraints={"video": False, "audio": True},
+        video_processor_factory=None,
+        audio_processor_factory=lambda: audio_processor,
+        async_processing=True,
+        # Set low latency for better performance with Render
+        audio_receiver_size=256,  # Smaller audio chunk size
+    )
+    
+    # Store the webrtc context in session state for access across reruns
+    st.session_state.webrtc_ctx = webrtc_ctx
+    
+except Exception as e:
+    st.error(f"Error initializing WebRTC: {str(e)}")
+    logger.error(f"WebRTC initialization error: {str(e)}")
+    # Provide a fallback mechanism
+    st.info("Trying alternative audio capture method...")
+    
+    # Here, we could implement a fallback using file upload
+    st.file_uploader("Upload audio file instead:", type=["wav", "mp3"])
+    st.warning("File upload is currently available as an alternative to live recording.")
 
 # WebRTC connection status and troubleshooting
-if webrtc_ctx.state.playing:
-    st.success("✅ WebRTC connection established successfully")
-    st.session_state.connection_attempt = False
-else:
-    # If connection is taking too long, show troubleshooting info
-    if st.session_state.connection_attempt:
-        st.warning("⚠️ WebRTC connection is taking longer than expected. Try the following:")
-        st.markdown("""
-        - Check your internet connection
-        - Try disabling any VPN you might be using
-        - Ensure your browser has microphone permissions
-        - Try refreshing the page
-        - Try using a different browser (Chrome works best)
-        """)
-    st.session_state.connection_attempt = True
+if hasattr(st.session_state, 'webrtc_ctx') and st.session_state.webrtc_ctx is not None:
+    if st.session_state.webrtc_ctx.state.playing:
+        st.success("✅ WebRTC connection established successfully")
+        st.session_state.connection_attempt = False
+    else:
+        # If connection is taking too long, show troubleshooting info
+        if st.session_state.connection_attempt:
+            st.warning("⚠️ WebRTC connection is taking longer than expected. Try the following:")
+            st.markdown("""
+            - Check your internet connection
+            - Try disabling any VPN you might be using
+            - Make sure your browser has microphone permissions:
+              - Click the lock icon in your address bar
+              - Ensure microphone access is allowed
+            - Try using Chrome browser for best compatibility
+            - Try refreshing the page
+            """)
+            
+            # Show network diagnostics
+            st.info("Running network diagnostics...")
+            try:
+                if check_connectivity():
+                    st.success("✅ Internet connection is working")
+                else:
+                    st.error("❌ Internet connection issue detected")
+            except:
+                st.error("❌ Failed to check internet connectivity")
+                
+        st.session_state.connection_attempt = True
 
 # Handle button clicks
 if start_button:
-    if webrtc_ctx.state.playing:
+    if hasattr(st.session_state, 'webrtc_ctx') and st.session_state.webrtc_ctx and st.session_state.webrtc_ctx.state.playing:
         st.session_state.recording = True
         status_text.info("🔴 Recording started...")
         logger.info("Recording started")
@@ -539,15 +578,10 @@ if stop_button and st.session_state.recording:
     st.session_state.recording = False
     status_text.info("⏹️ Recording stopped. Processing audio...")
     
-    # Process all audio from the buffer
-    frames = []
-    while not audio_processor.audio_buffer.empty():
-        try:
-            frames.append(audio_processor.audio_buffer.get_nowait())
-        except queue.Empty:
-            break
+    # Get recorded frames
+    frames = audio_processor.get_frames()
     
-    if frames:
+    if frames and len(frames) > 0:
         logger.info(f"Processing {len(frames)} audio frames")
         # Concatenate all frames
         audio_data = np.concatenate(frames, axis=0)
@@ -640,13 +674,18 @@ with st.expander("⚙️ Troubleshooting"):
     - Allow microphone permissions in your browser
     - Try closing other applications that might be using the microphone
     - Ensure your microphone is properly connected and selected in your system settings
+    
+    **Render Deployment Issues**
+    - Make sure your Render service has environment variables properly set
+    - Check Render logs for WebSocket connection issues
+    - Use the alternative file upload option if WebRTC consistently fails
     """)
 
 # Footer
 st.markdown("---")
 st.markdown(
     """<div style="text-align: center; color: #666;">
-    AI Passive SOS | Safety Through Technology | v1.0
+    AI Passive SOS | Safety Through Technology | v1.1
     </div>""", 
     unsafe_allow_html=True
 )
