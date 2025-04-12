@@ -1,19 +1,18 @@
+# Core dependencies
 streamlit
 numpy
 requests
-python-dotenv
-werkzeug
 
 # Audio processing
-sounddevice
-soundfile
+# Use pre-built wheel for PyAudio when possible
+PyAudio; platform_system != "Linux"
+# For Linux, use an alternative approach - your code has fallbacks
+sounddevice; platform_system != "Linux"
+
+# Optional WebRTC support
+streamlit-webrtc; platform_system != "Linux"
+
+# Other dependencies
+python-multipart
+werkzeug
 av
-
-# WebRTC support
-streamlit-webrtc
-
-# Logging
-logging
-
-# For deployment on Render
-PyAudio
