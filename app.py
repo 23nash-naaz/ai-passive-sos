@@ -12,10 +12,9 @@ import logging
 import wave
 import threading
 import queue
-import asyncio
-from aiortc.contrib.media import MediaRecorder, MediaBlackhole
-from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack
-from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
+import sounddevice as sd
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration, ClientSettings
+from werkzeug.utils import secure_filename
 
 # Configure logging
 logging.basicConfig(
@@ -39,7 +38,8 @@ DISTRESS_KEYWORDS = {"help", "sos", "emergency", "911", "save me", "distress", "
 # --- Network connectivity check ---
 def check_connectivity():
     try:
-        requests.get("https://www.google.com", timeout=5)
+        # Use a reliable endpoint with short timeout
+        requests.get("https://www.google.com", timeout=3)
         return True
     except requests.exceptions.RequestException:
         return False
@@ -58,8 +58,12 @@ def initialize_session_state():
         st.session_state.processing = False
     if 'connection_attempt' not in st.session_state:
         st.session_state.connection_attempt = False
-    if 'webrtc_ctx' not in st.session_state:
-        st.session_state.webrtc_ctx = None
+    if 'using_file_upload' not in st.session_state:
+        st.session_state.using_file_upload = False
+    if 'direct_recording' not in st.session_state:
+        st.session_state.direct_recording = False
+    if 'direct_recorder' not in st.session_state:
+        st.session_state.direct_recorder = None
 
 initialize_session_state()
 
@@ -117,6 +121,12 @@ st.markdown(
     .success {
         background-color: #e8f5e9;
         border-left: 5px solid #4caf50;
+    }
+    .method-selector {
+        background-color: #f5f5f5;
+        padding: 10px;
+        border-radius: 5px;
+        margin-bottom: 15px;
     }
     </style>
     """,
@@ -211,7 +221,7 @@ def upload_audio_to_assemblyai(audio_file_path):
                 data=f
             )
         
-        response.raise_for_status()  # Raise exception for non-200 status codes
+        response.raise_for_status()  # Throw exception for bad response codes
         upload_url = response.json()['upload_url']
         logger.info(f"Audio uploaded successfully. URL: {upload_url}")
         return upload_url
@@ -233,7 +243,7 @@ def request_transcription(audio_url):
         logger.info("Requesting transcription from AssemblyAI")
         response = requests.post(ASSEMBLYAI_TRANSCRIPT_URL, json=json_data, headers=headers)
         
-        response.raise_for_status()  # Raise exception for non-200 status codes
+        response.raise_for_status()  # Throw exception for bad response codes
         transcript_id = response.json()['id']
         logger.info(f"Transcription requested successfully. ID: {transcript_id}")
         return transcript_id
@@ -251,14 +261,14 @@ def poll_transcription(transcript_id):
     try:
         logger.info(f"Polling for transcription results: {transcript_id}")
         
-        # Maximum number of attempts (60 seconds * 30 = 30 minutes maximum wait time)
+        # Polling using incremental backoff for more reliable results
         max_attempts = 30
         
         for attempt in range(max_attempts):
             logger.info(f"Polling attempt {attempt+1}/{max_attempts}")
             response = requests.get(polling_url, headers=headers)
             
-            response.raise_for_status()  # Raise exception for non-200 status codes
+            response.raise_for_status()  # Throw exception for bad response codes
             result = response.json()
             
             if result['status'] == 'completed':
@@ -271,8 +281,8 @@ def poll_transcription(transcript_id):
                 st.error(error_msg)
                 return None
             
-            # Exponential backoff (2^attempt seconds, max 10 seconds)
-            wait_time = min(2 ** attempt, 10)
+            # Incremental backoff with max wait time
+            wait_time = min(2 + attempt, 10)
             time.sleep(wait_time)
         
         warning_msg = f"Transcription timed out after {max_attempts} attempts"
@@ -452,159 +462,197 @@ def process_audio(audio_bytes):
     finally:
         st.session_state.processing = False
 
-# --- Improved audio capture with streamlit-webrtc ---
+# --- Choose recording method ---
 st.markdown('<div class="section"><h3>Audio Recording</h3></div>', unsafe_allow_html=True)
 
-# Create a custom audio processor that will work better with Render
-class AudioProcessor:
-    def __init__(self):
-        self.frames = []
-        self.audio_lock = threading.Lock()
-        
-    def recv(self, frame):
-        """Process each audio frame"""
-        with self.audio_lock:
-            if st.session_state.recording:
-                sound = frame.to_ndarray().astype(np.float32)
-                self.frames.append(sound)
-        return frame
-    
-    def get_frames(self):
-        """Get current frames and clear buffer"""
-        with self.audio_lock:
-            result = self.frames
-            self.frames = []
-        return result
-
-# Create a status placeholder for recording status
-status_text = st.empty()
-if st.session_state.recording:
-    status_text.info("🔴 Recording in progress...")
-else:
-    status_text.info("🎤 Ready to record")
-
-# Buttons to start/stop recording
-col1, col2 = st.columns(2)
-with col1:
-    start_button = st.button("▶️ Start Recording")
-with col2:
-    stop_button = st.button("⏹️ Stop Recording")
-
-# WebRTC Configuration - Enhanced with multiple STUN servers
-rtc_configuration = RTCConfiguration(
-    {"iceServers": [
-        {"urls": ["stun:stun.l.google.com:19302"]},
-        {"urls": ["stun:stun1.l.google.com:19302"]},
-        {"urls": ["stun:stun2.l.google.com:19302"]},
-        # Add additional fallback STUN servers
-        {"urls": ["stun:stun.cloudflare.com:3478"]},
-        {"urls": ["stun:stun.stunprotocol.org:3478"]}
-    ]}
+# Create a radio button to select the input method
+st.markdown('<div class="method-selector">', unsafe_allow_html=True)
+input_method = st.radio(
+    "Choose recording method:",
+    ["File Upload", "Browser Microphone (WebRTC)"],
+    index=1,
+    help="If WebRTC doesn't work, try using file upload instead"
 )
+st.markdown('</div>', unsafe_allow_html=True)
 
-# Create audio processor
-audio_processor = AudioProcessor()
+# --- File Uploader Option ---
+if input_method == "File Upload":
+    st.session_state.using_file_upload = True
+    
+    st.write("Upload an audio file for processing:")
+    uploaded_file = st.file_uploader("Choose an audio file", type=['wav', 'mp3', 'm4a', 'ogg'])
+    
+    if uploaded_file is not None:
+        audio_bytes = uploaded_file.getvalue()
+        st.audio(audio_bytes, format=f"audio/{uploaded_file.type.split('/')[1]}")
+        
+        if st.button("Process Audio File"):
+            if not st.session_state.processing:
+                st.session_state.processing = True
+                process_audio(audio_bytes)
 
-# Enhanced WebRTC component with more diagnostics
-try:
-    webrtc_ctx = webrtc_streamer(
-        key="improved-audio-recorder",
-        mode=WebRtcMode.SENDONLY,
-        rtc_configuration=rtc_configuration, 
-        media_stream_constraints={"video": False, "audio": True},
-        video_processor_factory=None,
-        audio_processor_factory=lambda: audio_processor,
-        async_processing=True,
-        # Set low latency for better performance with Render
-        audio_receiver_size=256,  # Smaller audio chunk size
+# --- WebRTC Option ---
+elif input_method == "Browser Microphone (WebRTC)":
+    st.session_state.using_file_upload = False
+    
+    # Create a status placeholder for recording status
+    status_text = st.empty()
+    if st.session_state.recording:
+        status_text.info("🔴 Recording in progress...")
+    else:
+        status_text.info("🎤 Ready to record")
+    
+    # Custom AudioProcessor class
+    class AudioProcessor:
+        def __init__(self):
+            self.frames = []
+            self.audio_lock = threading.Lock()
+            
+        def recv(self, frame):
+            """Process each audio frame"""
+            with self.audio_lock:
+                if st.session_state.recording:
+                    # Lower the volume slightly to help with WebRTC clipping
+                    sound = frame.to_ndarray().astype(np.float32) * 0.95
+                    self.frames.append(sound)
+            return frame
+        
+        def get_frames(self):
+            """Get current frames and clear buffer"""
+            with self.audio_lock:
+                result = self.frames.copy()
+                self.frames = []
+            return result
+    
+    # Buttons to start/stop recording
+    col1, col2 = st.columns(2)
+    with col1:
+        start_button = st.button("▶️ Start Recording")
+    with col2:
+        stop_button = st.button("⏹️ Stop Recording")
+    
+    # WebRTC Configuration - Optimized for better connectivity
+    client_settings = ClientSettings(
+        rtc_configuration={
+            "iceServers": [
+                {"urls": ["stun:stun.cloudflare.com:3478"]},  # Cloudflare STUN
+                {"urls": ["stun:stun.l.google.com:19302"]},   # Google STUN
+                {"urls": ["stun:stun1.l.google.com:19302"]},
+                {"urls": ["stun:stun2.l.google.com:19302"]},
+                {"urls": ["stun:stun.stunprotocol.org:3478"]},
+                {"urls": ["stun:openrelay.metered.ca:80"]}    # Additional STUN servers
+            ]
+        },
+        media_stream_constraints={
+            "video": False,
+            "audio": {
+                "echoCancellation": True,
+                "noiseSuppression": True,
+                "autoGainControl": True
+            }
+        }
     )
     
-    # Store the webrtc context in session state for access across reruns
-    st.session_state.webrtc_ctx = webrtc_ctx
+    # Create audio processor
+    audio_processor = AudioProcessor()
     
-except Exception as e:
-    st.error(f"Error initializing WebRTC: {str(e)}")
-    logger.error(f"WebRTC initialization error: {str(e)}")
-    # Provide a fallback mechanism
-    st.info("Trying alternative audio capture method...")
-    
-    # Here, we could implement a fallback using file upload
-    st.file_uploader("Upload audio file instead:", type=["wav", "mp3"])
-    st.warning("File upload is currently available as an alternative to live recording.")
-
-# WebRTC connection status and troubleshooting
-if hasattr(st.session_state, 'webrtc_ctx') and st.session_state.webrtc_ctx is not None:
-    if st.session_state.webrtc_ctx.state.playing:
-        st.success("✅ WebRTC connection established successfully")
-        st.session_state.connection_attempt = False
-    else:
-        # If connection is taking too long, show troubleshooting info
-        if st.session_state.connection_attempt:
-            st.warning("⚠️ WebRTC connection is taking longer than expected. Try the following:")
-            st.markdown("""
-            - Check your internet connection
-            - Try disabling any VPN you might be using
-            - Make sure your browser has microphone permissions:
-              - Click the lock icon in your address bar
-              - Ensure microphone access is allowed
-            - Try using Chrome browser for best compatibility
-            - Try refreshing the page
-            """)
-            
-            # Show network diagnostics
-            st.info("Running network diagnostics...")
-            try:
-                if check_connectivity():
-                    st.success("✅ Internet connection is working")
-                else:
-                    st.error("❌ Internet connection issue detected")
-            except:
-                st.error("❌ Failed to check internet connectivity")
+    # Enhanced WebRTC component with more diagnostics
+    try:
+        # Use a larger key to force reinitialization
+        webrtc_ctx = webrtc_streamer(
+            key="fixed-audio-recorder-v2",
+            mode=WebRtcMode.SENDONLY,
+            client_settings=client_settings,
+            video_processor_factory=None,
+            audio_processor_factory=lambda: audio_processor,
+            async_processing=True,
+            audio_receiver_size=128,  # Smaller buffer for better reliability
+        )
+        
+        # WebRTC connection status and troubleshooting
+        if webrtc_ctx.state.playing:
+            st.success("✅ WebRTC connection established successfully")
+            st.session_state.connection_attempt = False
+        else:
+            if st.session_state.connection_attempt:
+                st.warning("⚠️ WebRTC connection is taking longer than expected.")
+                st.info("📋 Try these fixes:")
                 
-        st.session_state.connection_attempt = True
-
-# Handle button clicks
-if start_button:
-    if hasattr(st.session_state, 'webrtc_ctx') and st.session_state.webrtc_ctx and st.session_state.webrtc_ctx.state.playing:
-        st.session_state.recording = True
-        status_text.info("🔴 Recording started...")
-        logger.info("Recording started")
-    else:
-        st.error("❌ Cannot start recording. WebRTC connection not established.")
-        logger.error("Failed to start recording - no WebRTC connection")
-    
-if stop_button and st.session_state.recording:
-    logger.info("Recording stopped. Processing audio...")
-    st.session_state.recording = False
-    status_text.info("⏹️ Recording stopped. Processing audio...")
-    
-    # Get recorded frames
-    frames = audio_processor.get_frames()
-    
-    if frames and len(frames) > 0:
-        logger.info(f"Processing {len(frames)} audio frames")
-        # Concatenate all frames
-        audio_data = np.concatenate(frames, axis=0)
+                with st.expander("WebRTC Troubleshooting Tips"):
+                    st.markdown("""
+                    ### Fixing WebRTC Connection Issues
+                    
+                    1. **Browser Settings**:
+                       - Ensure your browser has permission to access your microphone
+                       - Try using Chrome, Edge, or Firefox (the most compatible browsers)
+                       - Disable any browser extensions that might be blocking media access
+                    
+                    2. **Network Issues**:
+                       - Disable VPN services if you're using them
+                       - Connect to a different network if possible
+                       - If on a corporate network, firewall settings might be blocking WebRTC
+                    
+                    3. **Try the file upload option** if WebRTC continues to fail
+                    """)
+                
+                # Add a helpful switch to file upload button
+                if st.button("Switch to file upload instead"):
+                    st.session_state.using_file_upload = True
+                    st.experimental_rerun()
+                    
+            st.session_state.connection_attempt = True
         
-        # Convert to int16 for WAV format
-        audio_int16 = (audio_data * 32767).astype(np.int16)
+        # Handle button clicks for WebRTC
+        if start_button:
+            if webrtc_ctx.state.playing:
+                st.session_state.recording = True
+                status_text.info("🔴 Recording started...")
+                logger.info("Recording started")
+            else:
+                st.error("❌ Cannot start recording. WebRTC connection not established.")
+                logger.error("Failed to start recording - no WebRTC connection")
         
-        # Create a BytesIO object and save as WAV
-        buf = BytesIO()
-        with wave.open(buf, 'wb') as wf:
-            wf.setnchannels(CHANNELS)
-            wf.setsampwidth(2)  # 16-bit audio
-            wf.setframerate(SAMPLE_RATE)
-            wf.writeframes(audio_int16.tobytes())
+        if stop_button and st.session_state.recording:
+            logger.info("Recording stopped. Processing audio...")
+            st.session_state.recording = False
+            status_text.info("⏹️ Recording stopped. Processing audio...")
+            
+            # Get recorded frames
+            frames = audio_processor.get_frames()
+            
+            if frames and len(frames) > 0:
+                logger.info(f"Processing {len(frames)} audio frames")
+                # Concatenate all frames
+                audio_data = np.concatenate(frames, axis=0)
+                
+                # Convert to int16 for WAV format
+                audio_int16 = (audio_data * 32767).astype(np.int16)
+                
+                # Create a BytesIO object and save as WAV
+                buf = BytesIO()
+                with wave.open(buf, 'wb') as wf:
+                    wf.setnchannels(CHANNELS)
+                    wf.setsampwidth(2)  # 16-bit audio
+                    wf.setframerate(SAMPLE_RATE)
+                    wf.writeframes(audio_int16.tobytes())
+                
+                # Start processing the audio
+                if not st.session_state.processing:
+                    st.session_state.processing = True
+                    buf.seek(0)  # Go back to the start of the BytesIO buffer
+                    process_audio(buf.read())
+            else:
+                st.warning("⚠️ No audio recorded. Please try again.")
+                logger.warning("No audio frames collected during recording")
+                
+    except Exception as e:
+        st.error(f"Error initializing WebRTC: {str(e)}")
+        logger.error(f"WebRTC initialization error: {str(e)}")
         
-        # Start processing the audio
-        if not st.session_state.processing:
-            st.session_state.processing = True
-            buf.seek(0)  # Go back to the start of the BytesIO buffer
-            process_audio(buf.read())
-    else:
-        st.warning("⚠️ No audio recorded. Please try again.")
-        logger.warning("No audio frames collected during recording")
+        # Automatically offer file upload as fallback
+        st.info("🔄 Switching to file upload mode due to WebRTC initialization error...")
+        st.session_state.using_file_upload = True
+        st.experimental_rerun()
 
 # --- Test Alert Button ---
 col1, col2 = st.columns(2)
@@ -631,9 +679,9 @@ with st.expander("📋 How to Use"):
        - Enter the recipient email for emergency alerts
     
     2. **Record Audio**:
-       - Click "Start Recording" to begin recording
-       - Speak clearly into your microphone
-       - Click "Stop Recording" when done to process the audio
+       - Choose your preferred input method (File Upload or WebRTC)
+       - For WebRTC: Click "Start Recording" to begin, then "Stop Recording" when done
+       - For File Upload: Upload an audio file and click "Process Audio File"
     
     3. **Monitor Results**:
        - The system will transcribe your speech
@@ -647,45 +695,37 @@ with st.expander("⚙️ Troubleshooting"):
     st.markdown("""
     ### Troubleshooting
     
-    **"Taking a while to connect" Message**
-    - This is often caused by network issues or VPN interference
-    - Try disabling VPN services if you're using them
-    - Ensure you're allowing WebRTC connections in your browser
-    - Try a different network connection if available
+    **WebRTC Connection Issues**
+    - If you see "Taking a while to connect" messages, try the File Upload option instead
+    - Try disabling VPN services or firewalls
+    - Check that your browser allows microphone access
+    - Use Chrome or Edge for better compatibility
     
-    **Browser Not Detecting Microphone**
+    **Browser Microphone Issues**
     - Make sure your browser has permission to access your microphone
-    - Try using Chrome or Edge for best compatibility
-    - Check browser settings (click the lock icon in address bar)
-    - Refresh the page and try again
+    - Check that your microphone is not being used by another application
+    - Try refreshing the page or restarting your browser
     
     **Email Alerts Not Sending**
     - For Gmail: Make sure you're using an App Password, not your regular password
     - Check that your email and password are entered correctly
     - Try the "Test Alert Email" button to verify your settings
-    - Check for any security settings that might be blocking the connection
     
     **Audio Processing Issues**
     - Speak clearly and avoid background noise
     - Make sure your recording is at least 1-2 seconds long
     - If transcription fails, try recording again
     
-    **Microphone Not Working**
-    - Allow microphone permissions in your browser
-    - Try closing other applications that might be using the microphone
-    - Ensure your microphone is properly connected and selected in your system settings
-    
     **Render Deployment Issues**
-    - Make sure your Render service has environment variables properly set
-    - Check Render logs for WebSocket connection issues
-    - Use the alternative file upload option if WebRTC consistently fails
+    - Try using the File Upload option which is more reliable on hosted platforms
+    - Check that all required dependencies are included in requirements.txt
     """)
 
 # Footer
 st.markdown("---")
 st.markdown(
     """<div style="text-align: center; color: #666;">
-    AI Passive SOS | Safety Through Technology | v1.1
+    AI Passive SOS | Safety Through Technology | v1.2
     </div>""", 
     unsafe_allow_html=True
 )
