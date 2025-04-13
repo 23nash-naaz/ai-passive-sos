@@ -1,354 +1,379 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-import base64
-import smtplib
+import streamlit as st
+import requests
 import json
-import os
-import io
-import numpy as np
+import base64
 import time
 import threading
-import sounddevice as sd
-import soundfile as sf
-import speech_recognition as sr
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 
-# Initialize Flask app
-app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+# API endpoint configuration
+API_BASE_URL = st.secrets.get("API_BASE_URL", "http://127.0.0.1:5000")  # Use Streamlit secrets for configuration
 
-# Global variables for state management
-CONFIG_FILE = "config.json"
-KEYWORDS_FILE = "keywords.json"
-is_recording = False
-distress_detected = False
-recording_thread = None
-last_result = None
+st.set_page_config(page_title="SOS API Tester", page_icon="🚨", layout="wide")
 
-# Load configuration
-def load_config():
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, 'r') as f:
-            return json.load(f)
-    return {
-        "email_username": "",
-        "email_password": "",
-        "recipient_email": ""
-    }
+# App title and description
+st.title("🚨 Passive SOS API Testing Interface")
+st.markdown("""
+This application allows you to test your Passive SOS API functionality without deploying to a production environment.
+Configure settings, test audio processing, and monitor the system status all from this interface.
+""")
 
-# Save configuration
-def save_config(config):
-    with open(CONFIG_FILE, 'w') as f:
-        json.dump(config, f)
+# Sidebar for configuration
+st.sidebar.header("Configuration")
 
-# Load keywords
-def load_keywords():
-    if os.path.exists(KEYWORDS_FILE):
-        with open(KEYWORDS_FILE, 'r') as f:
-            return json.load(f).get("keywords", [])
-    return ["help", "emergency", "stop", "danger", "fire", "hurt"]
+# API URL Configuration
+with st.sidebar.expander("API Configuration", expanded=True):
+    api_url = st.text_input("API Base URL", value=API_BASE_URL)
+    if api_url != API_BASE_URL:
+        API_BASE_URL = api_url
+        st.sidebar.success("API URL updated!")
 
-# Save keywords
-def save_keywords(keywords):
-    with open(KEYWORDS_FILE, 'w') as f:
-        json.dump({"keywords": keywords}, f)
+# Email Configuration
+with st.sidebar.expander("Email Settings", expanded=True):
+    email_username = st.text_input("Email Username", placeholder="your.email@gmail.com")
+    email_password = st.text_input("Email Password", type="password")
+    recipient_email = st.text_input("Recipient Email", placeholder="alert.recipient@example.com")
+    
+    if st.button("Save Email Settings"):
+        try:
+            response = requests.post(
+                f"{API_BASE_URL}/api/config",
+                json={
+                    "email_username": email_username,
+                    "email_password": email_password,
+                    "recipient_email": recipient_email
+                }
+            )
+            if response.status_code == 200:
+                st.sidebar.success("Email settings saved successfully!")
+            else:
+                st.sidebar.error(f"Failed to save settings: {response.text}")
+        except Exception as e:
+            st.sidebar.error(f"Error connecting to API: {str(e)}")
+    
+    if st.button("Test Email"):
+        try:
+            response = requests.post(f"{API_BASE_URL}/api/test_email")
+            if response.status_code == 200:
+                result = response.json()
+                if result.get("status") == "success":
+                    st.sidebar.success("Test email sent successfully!")
+                else:
+                    st.sidebar.error(f"Failed to send test email: {result.get('message')}")
+            else:
+                st.sidebar.error(f"API error: {response.text}")
+        except Exception as e:
+            st.sidebar.error(f"Error connecting to API: {str(e)}")
 
-# Initialize keywords if not exists
-if not os.path.exists(KEYWORDS_FILE):
-    save_keywords(["help", "emergency", "stop", "danger", "fire", "hurt"])
-
-# Function to send email alert
-def send_email_alert(detected_words):
+# Distress Keywords
+with st.sidebar.expander("Distress Keywords", expanded=True):
     try:
-        config = load_config()
-        if not all([config.get("email_username"), config.get("email_password"), config.get("recipient_email")]):
-            return False, "Email configuration incomplete"
-        
-        msg = MIMEMultipart()
-        msg['From'] = config["email_username"]
-        msg['To'] = config["recipient_email"]
-        msg['Subject'] = "EMERGENCY ALERT - Distress Keywords Detected"
-        
-        body = f"""
-        EMERGENCY ALERT
-        
-        Distress keywords have been detected through the Passive SOS system.
-        
-        Detected keywords: {', '.join(detected_words)}
-        
-        Time of detection: {time.strftime('%Y-%m-%d %H:%M:%S')}
-        
-        Please check on the person or contact emergency services if appropriate.
-        
-        This is an automated alert from the Passive SOS system.
-        """
-        
-        msg.attach(MIMEText(body, 'plain'))
-        
-        server = smtplib.SMTP('smtp.gmail.com', 587)
-        server.starttls()
-        server.login(config["email_username"], config["email_password"])
-        text = msg.as_string()
-        server.sendmail(config["email_username"], config["recipient_email"], text)
-        server.quit()
-        
-        return True, "Alert email sent successfully"
-    except Exception as e:
-        return False, f"Failed to send email: {str(e)}"
-
-# Audio processing function
-def process_audio_data(audio_data_base64):
-    global distress_detected, last_result
-    
-    try:
-        # Decode base64 audio data
-        audio_bytes = base64.b64decode(audio_data_base64)
-        
-        # Save to temporary file
-        with open("temp_audio.wav", "wb") as f:
-            f.write(audio_bytes)
-        
-        # Initialize recognizer
-        r = sr.Recognizer()
-        
-        # Load audio file
-        with sr.AudioFile("temp_audio.wav") as source:
-            audio = r.record(source)
-        
-        # Recognize speech
-        text = r.recognize_google(audio)
-        
-        # Check for distress keywords
-        keywords = load_keywords()
-        detected_words = []
-        
-        for keyword in keywords:
-            if keyword.lower() in text.lower():
-                detected_words.append(keyword)
-        
-        # If distress keywords detected, send alert
-        alert_sent = False
-        alert_message = ""
-        
-        if detected_words:
-            distress_detected = True
-            alert_sent, alert_message = send_email_alert(detected_words)
-        
-        # Prepare result
-        result = {
-            "text": text,
-            "distress_detected": len(detected_words) > 0,
-            "detected_words": detected_words,
-            "alert_sent": alert_sent,
-            "alert_message": alert_message
-        }
-        
-        # Store last result
-        last_result = result
-        
-        # Cleanup
-        if os.path.exists("temp_audio.wav"):
-            os.remove("temp_audio.wav")
-        
-        return result
-    
-    except sr.UnknownValueError:
-        return {"error": "Speech Recognition could not understand the audio"}
-    
-    except sr.RequestError as e:
-        return {"error": f"Could not request results from Speech Recognition service: {e}"}
-    
-    except Exception as e:
-        return {"error": f"Error processing audio: {str(e)}"}
-
-# Function to continuously record and process audio
-def continuous_recording():
-    global is_recording, distress_detected
-    
-    try:
-        fs = 44100  # Sample rate
-        duration = 5  # Seconds per recording
-        
-        while is_recording:
-            # Record audio
-            audio_data = sd.rec(int(duration * fs), samplerate=fs, channels=1)
-            sd.wait()
+        response = requests.get(f"{API_BASE_URL}/api/keywords")
+        if response.status_code == 200:
+            keywords = response.json().get("keywords", [])
+            keywords_text = st.text_area("Keywords (one per line)", 
+                                        value="\n".join(keywords if keywords else []))
             
-            # Normalize and convert to base64
-            audio_float32 = audio_data.astype(np.float32)
-            if audio_float32.max() > 0:
-                audio_float32 = audio_float32 / audio_float32.max()
-            
-            buffer = io.BytesIO()
-            sf.write(buffer, audio_float32, fs, format='WAV')
-            buffer.seek(0)
-            audio_base64 = base64.b64encode(buffer.read()).decode('utf-8')
-            
-            # Process the audio
-            result = process_audio_data(audio_base64)
-            
-            # If distress detected, stop recording and set flag
-            if result.get("distress_detected", False):
-                distress_detected = True
-                is_recording = False
-                break
-    except Exception as e:
-        print(f"Error in continuous recording: {str(e)}")
-        is_recording = False
-
-# API routes
-@app.route('/api/status', methods=['GET'])
-def get_status():
-    global is_recording, distress_detected, last_result
-    return jsonify({
-        "is_recording": is_recording,
-        "distress_detected": distress_detected,
-        "last_result": last_result
-    })
-
-@app.route('/api/config', methods=['GET'])
-def get_config():
-    config = load_config()
-    # Don't return password in response
-    if "email_password" in config:
-        config["email_password"] = "********" if config["email_password"] else ""
-    return jsonify(config)
-
-@app.route('/api/config', methods=['POST'])
-def update_config():
-    data = request.get_json()
-    config = load_config()
-    
-    if "email_username" in data:
-        config["email_username"] = data["email_username"]
-    if "email_password" in data:
-        config["email_password"] = data["email_password"]
-    if "recipient_email" in data:
-        config["recipient_email"] = data["recipient_email"]
-    
-    save_config(config)
-    return jsonify({"status": "success", "message": "Configuration updated successfully"})
-
-@app.route('/api/test_email', methods=['POST'])
-def test_email():
-    try:
-        success, message = send_email_alert(["TEST"])
-        if success:
-            return jsonify({"status": "success", "message": "Test email sent successfully"})
+            if st.button("Update Keywords"):
+                new_keywords = [k.strip() for k in keywords_text.split("\n") if k.strip()]
+                response = requests.post(
+                    f"{API_BASE_URL}/api/update_keywords",
+                    json={"keywords": new_keywords}
+                )
+                if response.status_code == 200:
+                    st.sidebar.success("Keywords updated successfully!")
+                else:
+                    st.sidebar.error(f"Failed to update keywords: {response.text}")
         else:
-            return jsonify({"status": "error", "message": message})
+            st.sidebar.error(f"Failed to fetch keywords: {response.text}")
     except Exception as e:
-        return jsonify({"status": "error", "message": str(e)})
+        st.sidebar.error(f"Error connecting to API: {str(e)}")
+        st.sidebar.info("Enter keywords below and click 'Update Keywords' when API is available")
+        keywords_text = st.text_area("Keywords (one per line)", value="help\nemergency\nhelp me")
 
-@app.route('/api/keywords', methods=['GET'])
-def get_keywords():
-    keywords = load_keywords()
-    return jsonify({"keywords": keywords})
+# Main content area with tabs
+tab1, tab2, tab3 = st.tabs(["Service Control", "Audio Testing", "System Status"])
 
-@app.route('/api/update_keywords', methods=['POST'])
-def update_keywords():
-    data = request.get_json()
-    keywords = data.get("keywords", [])
-    save_keywords(keywords)
-    return jsonify({"status": "success", "message": "Keywords updated successfully"})
-
-@app.route('/api/start_recording', methods=['POST'])
-def start_recording():
-    global is_recording, distress_detected, recording_thread
+# Tab 1: Service Control
+with tab1:
+    st.header("Passive SOS Service Control")
     
-    if not is_recording:
-        is_recording = True
-        distress_detected = False
-        recording_thread = threading.Thread(target=continuous_recording)
-        recording_thread.daemon = True
-        recording_thread.start()
-        return jsonify({"status": "success", "message": "Recording started successfully"})
-    else:
-        return jsonify({"status": "error", "message": "Recording is already in progress"})
-
-@app.route('/api/stop_recording', methods=['POST'])
-def stop_recording():
-    global is_recording
-    
-    if is_recording:
-        is_recording = False
-        return jsonify({"status": "success", "message": "Recording stopped successfully"})
-    else:
-        return jsonify({"status": "error", "message": "No recording in progress"})
-
-@app.route('/api/process_audio', methods=['POST'])
-def process_audio():
-    data = request.get_json()
-    audio_data = data.get("audio_data")
-    
-    if not audio_data:
-        return jsonify({"status": "error", "message": "No audio data provided"}), 400
-    
+    # Get current status
     try:
-        result = process_audio_data(audio_data)
-        return jsonify({"status": "success", "result": result})
+        response = requests.get(f"{API_BASE_URL}/api/status")
+        if response.status_code == 200:
+            status = response.json()
+            is_recording = status.get("is_recording", False)
+            distress_detected = status.get("distress_detected", False)
+            
+            # Status indicators
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Recording Status", "Active" if is_recording else "Inactive")
+            with col2:
+                st.metric("Distress Detected", "YES" if distress_detected else "No")
+            
+            # Control buttons
+            if is_recording:
+                if st.button("Stop Recording", key="stop_btn"):
+                    response = requests.post(f"{API_BASE_URL}/api/stop_recording")
+                    if response.status_code == 200:
+                        st.success("Recording stopped successfully!")
+                        time.sleep(1)  # Small delay before rerunning
+                        st.rerun()
+                    else:
+                        st.error(f"Failed to stop recording: {response.text}")
+            else:
+                if st.button("Start Recording", key="start_btn"):
+                    response = requests.post(f"{API_BASE_URL}/api/start_recording")
+                    if response.status_code == 200:
+                        st.success("Recording started successfully!")
+                        time.sleep(1)  # Small delay before rerunning
+                        st.rerun()
+                    else:
+                        st.error(f"Failed to start recording: {response.text}")
+        else:
+            st.error(f"Failed to get status: {response.text}")
     except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+        st.error(f"Error connecting to API: {str(e)}")
+        st.warning("API connection failed. Please check if the API server is running and the URL is correct.")
 
-@app.route('/api/record_audio', methods=['POST'])
-def record_audio():
+    # Last processing result
+    st.subheader("Last Processing Result")
     try:
-        data = request.get_json()
-        duration = data.get('duration', 5)  # Default to 5 seconds if not specified
-        
-        # Record audio in the main thread (this is safe)
-        fs = 44100  # Sample rate
-        channels = 1  # Mono
-        
-        # Record audio
-        audio_data = sd.rec(int(duration * fs), samplerate=fs, channels=channels)
-        sd.wait()  # Wait until recording is finished
-        
-        # Normalize audio data
-        audio_float32 = audio_data.astype(np.float32)
-        if audio_float32.max() > 0:
-            audio_float32 = audio_float32 / audio_float32.max()
-        
-        # Convert to base64
-        buffer = io.BytesIO()
-        sf.write(buffer, audio_float32, 44100, format='WAV')
-        buffer.seek(0)
-        audio_base64 = base64.b64encode(buffer.read()).decode('utf-8')
-        
-        return jsonify({
-            "status": "success",
-            "message": f"Audio recorded for {duration} seconds",
-            "audio_data": audio_base64
-        })
-    
+        response = requests.get(f"{API_BASE_URL}/api/status")
+        if response.status_code == 200:
+            status = response.json()
+            if "last_result" in status:
+                last_result = status["last_result"]
+                st.json(last_result)
+            else:
+                st.info("No processing results available yet.")
+        else:
+            st.error(f"Failed to get status: {response.text}")
     except Exception as e:
-        return jsonify({
-            "status": "error",
-            "message": f"Error recording audio: {str(e)}"
-        }), 500
+        st.error(f"Error connecting to API: {str(e)}")
 
-@app.route('/api/reset', methods=['POST'])
-def reset_status():
-    global distress_detected
-    distress_detected = False
-    return jsonify({"status": "success", "message": "Status reset successfully"})
+# Tab 2: Audio Testing
+with tab2:
+    st.header("Audio Testing")
+    st.markdown("""
+    This section allows you to test the SOS API with audio input in two ways:
+    1. Record audio through the API's microphone capabilities 
+    2. Upload an audio file to test distress detection
+    """)
 
-# Run the app
-if __name__ == '__main__':
-    # Make sure required files exist
-    if not os.path.exists(CONFIG_FILE):
-        save_config({
-            "email_username": "",
-            "email_password": "",
-            "recipient_email": ""
-        })
+    # Audio recording (Modified to use the API for recording)
+    st.subheader("Record Audio")
     
-    # Run without debug mode or reloader to avoid threading issues
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    col1, col2 = st.columns(2)
+    with col1:
+        record_button = st.button("Request Audio Recording from API")
+    with col2:
+        record_duration = st.slider("Recording Duration (seconds)", 3, 15, 5)
     
-    # Alternative if you need debug features but no reloader:
-    # app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)
+    # Process the recorded audio
+    if record_button:
+        with st.spinner(f"Requesting API to record audio for {record_duration} seconds..."):
+            try:
+                # Request the API to record audio
+                response = requests.post(
+                    f"{API_BASE_URL}/api/record_audio",
+                    json={"duration": record_duration}
+                )
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    if result.get("status") == "success":
+                        st.success("Audio recorded successfully through the API!")
+                        
+                        # If API returns the audio data, we can process it
+                        if "audio_data" in result:
+                            audio_base64 = result["audio_data"]
+                            
+                            # Process the audio
+                            try:
+                                process_response = requests.post(
+                                    f"{API_BASE_URL}/api/process_audio",
+                                    json={"audio_data": audio_base64}
+                                )
+                                
+                                if process_response.status_code == 200:
+                                    process_result = process_response.json()
+                                    st.subheader("Processing Result")
+                                    st.json(process_result)
+                                    
+                                    # Highlight if distress was detected
+                                    if process_result.get("result", {}).get("distress_detected", False):
+                                        st.warning("⚠️ Distress keywords detected in the audio!")
+                                        if process_result.get("result", {}).get("alert_sent", False):
+                                            st.success("✅ Alert email was sent successfully!")
+                                        else:
+                                            st.error("❌ Alert email was not sent. Check email configuration.")
+                                else:
+                                    st.error(f"API error processing audio: {process_response.text}")
+                            except Exception as e:
+                                st.error(f"Error processing recorded audio: {str(e)}")
+                    else:
+                        st.error(f"Failed to record audio: {result.get('message')}")
+                else:
+                    st.error(f"API error: {response.text}")
+            except Exception as e:
+                st.error(f"Error connecting to API: {str(e)}")
+    
+    # File uploader for testing
+    st.subheader("Upload Audio File")
+    uploaded_file = st.file_uploader("Choose an audio file", type=["wav", "mp3"])
+    
+    if uploaded_file is not None:
+        if st.button("Process Uploaded Audio"):
+            with st.spinner("Processing uploaded audio..."):
+                # Read the file and convert to base64
+                audio_bytes = uploaded_file.read()
+                audio_base64 = base64.b64encode(audio_bytes).decode('utf-8')
+                
+                # Send to API
+                try:
+                    response = requests.post(
+                        f"{API_BASE_URL}/api/process_audio",
+                        json={"audio_data": audio_base64}
+                    )
+                    
+                    if response.status_code == 200:
+                        result = response.json()
+                        st.subheader("Processing Result")
+                        st.json(result)
+                        
+                        # Highlight if distress was detected
+                        if result.get("result", {}).get("distress_detected", False):
+                            st.warning("⚠️ Distress keywords detected in the audio!")
+                            if result.get("result", {}).get("alert_sent", False):
+                                st.success("✅ Alert email was sent successfully!")
+                            else:
+                                st.error("❌ Alert email was not sent. Check email configuration.")
+                    else:
+                        st.error(f"API error: {response.text}")
+                except Exception as e:
+                    st.error(f"Error connecting to API: {str(e)}")
+
+# Tab 3: System Status
+with tab3:
+    st.header("System Status Monitor")
+    
+    # Status display
+    st.subheader("Current System Status")
+    status_placeholder = st.empty()
+    
+    # Function to update status
+    def update_status():
+        try:
+            response = requests.get(f"{API_BASE_URL}/api/status")
+            if response.status_code == 200:
+                status = response.json()
+                
+                # Check if recording is active
+                is_recording = status.get("is_recording", False)
+                distress_detected = status.get("distress_detected", False)
+                
+                # Create status message
+                status_message = st.container()
+                with status_message:
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        if is_recording:
+                            st.success("✅ Service is ACTIVE")
+                        else:
+                            st.error("❌ Service is INACTIVE")
+                    with col2:
+                        if distress_detected:
+                            st.warning("⚠️ Distress has been detected!")
+                        else:
+                            st.info("No distress detected")
+                
+                # Display last result if available
+                if "last_result" in status:
+                    st.subheader("Latest Processing Result")
+                    st.json(status["last_result"])
+                
+                # Get configuration
+                try:
+                    config_response = requests.get(f"{API_BASE_URL}/api/config")
+                    if config_response.status_code == 200:
+                        config = config_response.json()
+                        
+                        st.subheader("Configuration")
+                        st.markdown(f"""
+                        - **Email Username**: {config.get("email_username") or "Not configured"}
+                        - **Recipient Email**: {config.get("recipient_email") or "Not configured"}
+                        """)
+                except Exception as e:
+                    st.error(f"Error fetching configuration: {str(e)}")
+                
+                # Display keywords
+                try:
+                    keywords_response = requests.get(f"{API_BASE_URL}/api/keywords")
+                    if keywords_response.status_code == 200:
+                        keywords = keywords_response.json().get("keywords", [])
+                        
+                        st.subheader("Distress Keywords")
+                        if keywords:
+                            st.write(", ".join(keywords))
+                        else:
+                            st.write("No keywords configured")
+                except Exception as e:
+                    st.error(f"Error fetching keywords: {str(e)}")
+                
+                return True
+            else:
+                st.error(f"Failed to get status: {response.text}")
+                return False
+        except Exception as e:
+            st.error(f"Error connecting to API: {str(e)}")
+            return False
+    
+    # Initial status update
+    status_updated = update_status()
+    
+    # Auto-refresh toggle
+    auto_refresh = st.checkbox("Auto-refresh status (every 5 seconds)")
+    
+    # Create a placeholder for the countdown
+    refresh_placeholder = st.empty()
+    
+    # Store the auto-refresh state in session state
+    if 'auto_refresh' not in st.session_state:
+        st.session_state.auto_refresh = False
+        st.session_state.refresh_time = time.time()
+    
+    if auto_refresh != st.session_state.auto_refresh:
+        st.session_state.auto_refresh = auto_refresh
+        st.session_state.refresh_time = time.time()
+    
+    # Handle auto-refresh with a safer approach for Streamlit Cloud
+    if auto_refresh:
+        refresh_interval = 5  # seconds
+        current_time = time.time()
+        elapsed = current_time - st.session_state.refresh_time
+        
+        if elapsed >= refresh_interval:
+            status_placeholder.empty()
+            with status_placeholder:
+                update_status()
+            st.session_state.refresh_time = current_time
+            
+        remaining = max(0, refresh_interval - elapsed)
+        refresh_placeholder.text(f"Refreshing in {int(remaining)} seconds...")
+        time.sleep(1)  # Add a small delay for smoother updates
+        st.rerun()
+    else:
+        if st.button("Refresh Status Now"):
+            status_placeholder.empty()
+            with status_placeholder:
+                update_status()
+            st.session_state.refresh_time = time.time()
+
+# Footer
+st.markdown("---")
+st.markdown("SOS API Testing Interface | © 2025")
 
    
 
