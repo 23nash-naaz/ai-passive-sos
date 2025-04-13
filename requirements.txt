@@ -1,11 +1,5 @@
-Flask
-flask-cors
-numpy
-sounddevice
-soundfile
-SpeechRecognition
-requests
-streamlit
-gunicorn
+ streamlit
+  requests
+  python-dotenv
 
 
