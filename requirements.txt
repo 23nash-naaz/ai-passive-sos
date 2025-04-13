@@ -1,5 +1,8 @@
- streamlit
-  requests
-  python-dotenv
-
+flask
+flask-cors
+numpy
+sounddevice
+soundfile
+speechrecognition
+waitress
 
